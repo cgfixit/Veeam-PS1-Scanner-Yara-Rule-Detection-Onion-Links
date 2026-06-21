@@ -67,3 +67,14 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
+
+      # Fallback: also publish the raw SARIF as a build artifact so findings stay
+      # accessible even if code-scanning upload is unavailable (e.g. a private
+      # repo without GitHub Advanced Security). Runs regardless of prior outcome.
+      - name: Upload SARIF as build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psscriptanalyzer-sarif
+          path: results.sarif
+          if-no-files-found: warn
