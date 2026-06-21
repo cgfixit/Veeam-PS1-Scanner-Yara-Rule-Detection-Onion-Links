@@ -383,25 +383,58 @@ try {
         exit 0
     }
     
-    $allFindings = @()
-    
-    # Scan each mounted volume
-    foreach ($volume in $volumes) {
+    $findingsBag = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+    # Capture all functions and script-scope variables needed inside parallel threads
+    $fnInvokeYARAScan   = ${function:Invoke-YARAScan}.ToString()
+    $fnParseYARAOutput  = ${function:Parse-YARAOutput}.ToString()
+    $fnGetScanTargets   = ${function:Get-ScanTargets}.ToString()
+    $fnConvertPath      = ${function:Convert-ToWindowsPath}.ToString()
+    $fnWriteLog         = ${function:Write-Log}.ToString()
+
+    # Scan each mounted volume in parallel — one thread per volume.
+    # ThrottleLimit caps concurrent threads to CPU count so YARA I/O doesn't
+    # saturate the proxy's disk when many VMs are mounted simultaneously.
+    $throttle = [Environment]::ProcessorCount
+    Write-Log "Starting parallel scan of $($volumes.Count) volume(s) (throttle: $throttle threads)"
+
+    $volumes | ForEach-Object -Parallel {
+        $volume = $_
+
+        # Re-define functions in this thread's scope
+        ${function:Write-Log}            = $using:fnWriteLog
+        ${function:Invoke-YARAScan}      = $using:fnInvokeYARAScan
+        ${function:Parse-YARAOutput}     = $using:fnParseYARAOutput
+        ${function:Get-ScanTargets}      = $using:fnGetScanTargets
+        ${function:Convert-ToWindowsPath}= $using:fnConvertPath
+
+        # Re-bind script-scope variables the functions reference
+        $script:LogMutex    = $using:script:LogMutex
+        $logFile            = $using:logFile
+        $YaraPath           = $using:YaraPath
+        $YaraRulesPath      = $using:YaraRulesPath
+        $ScanTimeout        = $using:ScanTimeout
+        $QuickScan          = $using:QuickScan
+        $bag                = $using:findingsBag
+
         Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         Write-Log "Processing volume: $($volume.DriveLetter) (VM: $($volume.VMName))"
-        
+
         $scanTargets = Get-ScanTargets -VolumeRoot $volume.DriveLetter
         Write-Log "Scan targets: $($scanTargets.Count) path(s)"
-        
-        $findings = Invoke-YARAScan -ScanPaths $scanTargets -VolumeRoot $volume.DriveLetter -VMName $volume.VMName
-        
+
+        $findings = Invoke-YARAScan -ScanPaths $scanTargets `
+                        -VolumeRoot $volume.DriveLetter -VMName $volume.VMName
+
         if ($findings) {
             Write-Log "⚠️  Found $($findings.Count) matches in $($volume.DriveLetter)" -Level "WARNING"
-            $allFindings += $findings
+            foreach ($f in $findings) { $bag.Add($f) }
         } else {
             Write-Log "✓ No threats detected in $($volume.DriveLetter)"
         }
-    }
+    } -ThrottleLimit $throttle
+
+    $allFindings = @($findingsBag)
     
     # Display results
     Write-Log ""
