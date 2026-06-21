@@ -1,0 +1,55 @@
+# Gitleaks Secret Detection Workflow
+# Scans the Veeam YARA Scanner repository for hardcoded secrets, API keys,
+# credentials, and other sensitive data that should not be committed.
+#
+# https://github.com/gitleaks/gitleaks
+# https://github.com/gitleaks/gitleaks-action
+
+name: Gitleaks
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '30 7 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    permissions:
+      contents: read
+      security-events: write
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for accurate secret detection
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_REPORT_FORMAT: sarif
+          GITLEAKS_REPORT_PATH: gitleaks-report.sarif
+
+      # Upload SARIF to GitHub code scanning (Security > Code scanning)
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gitleaks-report.sarif
+
+      # Fallback: also publish the SARIF as a build artifact
+      - name: Upload SARIF as build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks-report.sarif
+          if-no-files-found: warn
