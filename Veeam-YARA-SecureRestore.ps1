@@ -1,6 +1,10 @@
+#Requires -Version 7.0
 # Veeam-YARA-SecureRestore.ps1
 # Native Windows YARA scanner for Veeam Secure Restore
 # Extracts matched onion link strings with full file path details
+#
+# Requires PowerShell 7.0+ (Veeam v13 ships PS7 on Windows).
+# Uses Start-ThreadJob (in-process, lower overhead than Start-Job).
 
 param(
     [Parameter(Mandatory=$false)]
@@ -30,17 +34,26 @@ $jobId = if ($SessionId) { $SessionId } else { "Manual_$timestamp" }
 $logFile = Join-Path $LogPath "scan_${jobId}_${timestamp}.log"
 $jsonReport = Join-Path $LogPath "results_${jobId}_${timestamp}.json"
 
+# Mutex guards the log file when parallel thread jobs write concurrently (PR-D).
+$script:LogMutex = [System.Threading.Mutex]::new($false, "VeeamYARAScanLog")
+
 function Write-Log {
     param(
         [string]$Message,
         [ValidateSet("INFO", "WARNING", "ERROR")]
         [string]$Level = "INFO"
     )
-    
+
     $logEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
     Write-Host $logEntry
-    Add-Content -Path $logFile -Value $logEntry
-    
+
+    $null = $script:LogMutex.WaitOne(5000)
+    try {
+        [System.IO.File]::AppendAllText($logFile, "$logEntry`n")
+    } finally {
+        $script:LogMutex.ReleaseMutex()
+    }
+
     <#
         Placeholder since that cmdlet doesnt exist yet (only relevant for unified veeam logging; otherwise the paths for this script log are defined
     #>
@@ -168,8 +181,10 @@ function Invoke-YARAScan {
             )
             
             try {
-                # Execute YARA with timeout
-                $job = Start-Job -ScriptBlock {
+                # Execute YARA with timeout.
+                # Start-ThreadJob (PS7 in-process) is significantly faster than
+                # Start-Job (out-of-process) for short-lived per-rule invocations.
+                $job = Start-ThreadJob -ScriptBlock {
                     param($exe, $args)
                     & $exe @args 2>&1
                 } -ArgumentList $YaraPath, $yaraArgs
