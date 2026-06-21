@@ -38,14 +38,18 @@ The native Windows scanner provides:
 - **Veeam job integration** - Exit codes that block unsafe restores automatically
 - **Quick scan mode** - Target high-risk locations (ransomware hot spots)
 
+**PowerShell 5.1 is now the primary requirement.** PS7+ is used automatically when available for in-process parallel acceleration via `ThreadJob`/`Start-Job`, falling back to sequential mode on PS5.1-only systems. Two new YARA rules (`i2p_malware_indicator` and `freenet_darknet_indicator`) expand coverage beyond Tor. Optional `-SyslogServer` / `-VeeamOneServer` parameters enable RFC-5424 syslog and Veeam ONE REST API alerting on detection.
+
 ---
 
 ## Rules Included
 
 - **comprehensive_onion_detection** - Detects Tor `.onion` links with ransomware context (ransom notes, payment instructions)
-- **onion_links_simple** - Broad detection of any Tor `.onion` links
+- **onion_links_simple** - Broad detection of any Tor `.onion` links (1 MB filesize cap; excludes common FP strings such as Tor Browser documentation and security research)
 - **ransomware_payment_portal** - Identifies payment portals using `.onion` addresses with urgency indicators
 - **tor_c2_configuration** - Detects C2 configuration patterns referencing Tor hidden services
+- **i2p_malware_indicator** - Detects I2P `.i2p` / `.b32.i2p` hidden-service addresses in ransomware/C2 context (severity: HIGH)
+- **freenet_darknet_indicator** - Detects Freenet `CHK@`/`SSK@`/`USK@`/`KSK@` URI patterns in malicious context (severity: MEDIUM)
 
 ---
 
@@ -124,14 +128,14 @@ New-Item -ItemType Directory -Path "C:\ProgramData\YARA\Rules" -Force
 3. **Download YARA rule file**
 
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/lostSail0r/Veeam-Yara-Detection-Onion-/main/yara-malware-detection.yara" `
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links/main/yara-malware-detection.yara" `
                   -OutFile "C:\ProgramData\YARA\Rules\yara-malware-detection.yara"
 ```
 
 4. **Download PowerShell scanner**
 
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/lostSail0r/Veeam-Yara-Detection-Onion-/main/Veeam-YARA-SecureRestore.ps1" `
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links/main/Veeam-YARA-SecureRestore.ps1" `
                   -OutFile "C:\Scripts\Veeam-YARA-SecureRestore.ps1"
 ```
 
@@ -362,6 +366,8 @@ rule onion_links_simple {
 - Any v2 or v3 .onion address
 - **Warning:** May produce false positives on privacy guides, Tor documentation, or academic papers.
 
+> **Note:** The rule shown above is simplified for illustration. The current version in `yara-malware-detection.yara` uses a 1 MB filesize cap and includes false-positive exclusion strings (Tor Browser, privacy guide, Tails, onion service, hidden service, OSINT, threat intelligence, security research). See the rule file for the full text.
+
 ---
 
 ### 3. ransomware_payment_portal
@@ -455,7 +461,7 @@ rule tor_c2_configuration {
 - **YARA Version:** v4.4+ (tested with 4.4.0)
 - **Veeam Version:** Backup & Replication v12.x / v13.x
 - **Operating System:** Windows Server 2016+ (for PowerShell scanner)
-- **PowerShell:** v5.1+ (v7+ required for Veeam v13 on Linux mount servers)
+- **PowerShell:** v5.1+ primary; v7+ used automatically when available for in-process parallel acceleration via ThreadJob
 - **Mount Servers:** Windows-based mount servers or SureBackup proxies
 
 **Note:** Comments using `//` in YARA rules may cause errors in some Veeam contexts - use `/* */` style if issues occur.
@@ -477,7 +483,7 @@ New-Item -ItemType Directory -Path "C:\Scripts" -Force
 New-Item -ItemType Directory -Path "C:\ProgramData\Veeam\Logs\YARA-SecureRestore" -Force
 
 # 3. Download files
-$baseUrl = "https://raw.githubusercontent.com/lostSail0r/Veeam-Yara-Detection-Onion-/main"
+$baseUrl = "https://raw.githubusercontent.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links/main"
 Invoke-WebRequest -Uri "$baseUrl/yara-malware-detection.yara" `
                   -OutFile "C:\ProgramData\YARA\Rules\yara-malware-detection.yara"
 Invoke-WebRequest -Uri "$baseUrl/Veeam-YARA-SecureRestore.ps1" `
@@ -650,7 +656,7 @@ Test-Path "C:\Program Files\YARA\yara64.exe"
 Get-ChildItem "C:\ProgramData\YARA\Rules" -Filter "*.yar*"
 
 # Re-download if missing
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/lostSail0r/Veeam-Yara-Detection-Onion-/main/yara-malware-detection.yara" `
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links/main/yara-malware-detection.yara" `
                   -OutFile "C:\ProgramData\YARA\Rules\yara-malware-detection.yara"
 ```
 
@@ -708,7 +714,7 @@ Contributions welcome! Please submit:
 - **Author:** CG [[@cgfixit]](https://linktr.ee/cgrady92)
 - **Category:** Ransomware Detection, Tor/Onion IOCs, C2 Detection
 - **License:** MIT
-- **Last Updated:** December 23, 2025
+- **Last Updated:** June 2026
 
 ---
 
@@ -716,5 +722,5 @@ Contributions welcome! Please submit:
 
 - [YARA Documentation](https://yara.readthedocs.io/)
 - [Veeam Secure Restore Guide](https://helpcenter.veeam.com/docs/vbr/userguide/malware_detection_scan_backup_yara.html)
-- [GitHub Repository](https://github.com/lostSail0r/Veeam-Yara-Detection-Onion-)
-- [Report Issues](https://github.com/lostSail0r/Veeam-Yara-Detection-Onion-/issues)
+- [GitHub Repository](https://github.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links)
+- [Report Issues](https://github.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links/issues)
