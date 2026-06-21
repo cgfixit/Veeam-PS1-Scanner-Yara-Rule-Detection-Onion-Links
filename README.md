@@ -603,6 +603,29 @@ Test against:
 - Ransom note templates (Conti, LockBit, BlackCat, REvil, ALPHV)
 - C2 configuration files from public malware analysis reports
 
+#### End-to-End Secure Restore Emulation (Chrome History Onion IOC)
+
+Use this workflow to emulate a backup that contains an onion indicator in Chrome history data and verify restore blocking behavior:
+
+1. Create a test restore point from a VM containing a known `.onion` string under:
+   - `C:\Users\<User>\AppData\Local\Google\Chrome\User Data\Default\History`
+   - If testing with environment variables, use `%LOCALAPPDATA%\Google\Chrome\User Data\Default\History` (not `D:\%localappdata&\...`, which is malformed).
+2. Mount that restore point in Secure Restore or SureBackup so the VM appears as a mounted Windows volume (for example `E:\` or `F:\`) on the mount server.
+3. Verify scanner prerequisites on the mount server:
+   - `C:\Program Files\YARA\yara64.exe`
+   - At least one `.yar`/`.yara` file in `C:\ProgramData\YARA\Rules`
+4. Run full scan mode (do **not** use `-QuickScan` for this scenario):
+   ```powershell
+   .\Veeam-YARA-SecureRestore.ps1
+   ```
+5. Review output in `C:\ProgramData\Veeam\Logs\YARA-SecureRestore\`:
+   - `scan_*.log` for per-file detections
+   - `results_*.json` for structured findings, extracted onion links, and path mapping
+6. Validate expected exit behavior:
+   - `1` = detection found (restore should be blocked)
+   - `0` = no detection
+   - `2` = script/runtime error
+
 #### Create Synthetic Test Files
 
 ```powershell
