@@ -23,7 +23,27 @@ param(
     [int]$ScanTimeout = 3600,  # 1 hour
     
     [Parameter(Mandatory=$false)]
-    [switch]$QuickScan  # Only scan common malware locations
+    [switch]$QuickScan,  # Only scan common malware locations
+
+    # ── Syslog / SIEM integration (opt-in) ──────────────────────────────────
+    [Parameter(Mandatory=$false)]
+    [switch]$EnableSyslog,
+
+    [Parameter(Mandatory=$false)]
+    [string]$SyslogServer = "127.0.0.1",
+
+    [Parameter(Mandatory=$false)]
+    [int]$SyslogPort = 514,
+
+    # ── Veeam ONE integration (opt-in) ───────────────────────────────────────
+    [Parameter(Mandatory=$false)]
+    [switch]$EnableVeeamOne,
+
+    [Parameter(Mandatory=$false)]
+    [string]$VeeamOneServer = "localhost",
+
+    [Parameter(Mandatory=$false)]
+    [int]$VeeamOnePort = 1239
 )
 
 # Initialize logging
@@ -62,6 +82,58 @@ function Write-Log {
             Add-VBRJobLogEvent -Message $Message -Type $Level
         }
     } catch {}
+}
+
+function Send-SyslogAlert {
+    param(
+        [string]$Message,
+        [ValidateRange(0,7)]
+        [int]$Severity = 4  # 4 = Warning; 2 = Critical; 6 = Informational
+    )
+    if (-not $EnableSyslog) { return }
+
+    # RFC 5424 syslog over UDP — no external module required
+    $facility  = 16   # local0
+    $pri       = ($facility * 8) + $Severity
+    $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    $hostname  = $env:COMPUTERNAME
+    $appName   = "VeeamYARAScanner"
+    $syslogMsg = "<$pri>1 $timestamp $hostname $appName - - - $Message"
+
+    $udp = [System.Net.Sockets.UdpClient]::new()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($syslogMsg)
+        $udp.Send($bytes, $bytes.Length, $SyslogServer, $SyslogPort) | Out-Null
+        Write-Log "Syslog alert sent to ${SyslogServer}:${SyslogPort}"
+    } catch {
+        Write-Log "WARNING: Syslog send failed: $_" -Level "WARNING"
+    } finally {
+        $udp.Dispose()
+    }
+}
+
+function Send-VeeamOneAlarm {
+    param(
+        [string]$AlarmMessage,
+        [int]$FindingsCount
+    )
+    if (-not $EnableVeeamOne) { return }
+
+    # Veeam ONE REST API — raises a MalwareDetected alarm visible in the console
+    $uri  = "http://${VeeamOneServer}:${VeeamOnePort}/api/v2.1/alarms"
+    $body = @{
+        name    = "MalwareDetected"
+        message = $AlarmMessage
+        details = "Veeam YARA Secure Restore detected $FindingsCount malware indicator(s). Review before restoring."
+    } | ConvertTo-Json
+
+    try {
+        $null = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
+            -ContentType "application/json" -UseDefaultCredentials
+        Write-Log "Veeam ONE alarm raised at ${VeeamOneServer}:${VeeamOnePort}"
+    } catch {
+        Write-Log "WARNING: Veeam ONE alarm failed: $_" -Level "WARNING"
+    }
 }
 
 function Get-MountedVMVolumes {
@@ -415,7 +487,12 @@ try {
         Write-Log ""
         Write-Log "⚠️⚠️⚠️  ONION LINKS DETECTED - INFECTED FILES  ⚠️⚠️⚠️" -Level "WARNING"
         Write-Log ""
-        
+
+        # Emit alerts to SIEM and/or Veeam ONE before displaying detail
+        $alertMsg = "MALWARE DETECTED: $($allFindings.Count) YARA match(es) across $($volumes.Count) volume(s). Job: $jobId"
+        Send-SyslogAlert -Message $alertMsg -Severity 2   # Critical
+        Send-VeeamOneAlarm -AlarmMessage $alertMsg -FindingsCount $allFindings.Count
+
         $results = Export-ScanResults -AllFindings $allFindings
         
         # Display detailed findings with onion links
