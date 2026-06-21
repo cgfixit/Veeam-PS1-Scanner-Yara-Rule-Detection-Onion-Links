@@ -30,6 +30,9 @@ $jobId = if ($SessionId) { $SessionId } else { "Manual_$timestamp" }
 $logFile = Join-Path $LogPath "scan_${jobId}_${timestamp}.log"
 $jsonReport = Join-Path $LogPath "results_${jobId}_${timestamp}.json"
 
+# Flag to emit the Add-VBRJobLogEvent warning only once per run, not on every log call.
+$script:VBRLogEventWarned = $false
+
 function Write-Log {
     param(
         [string]$Message,
@@ -44,9 +47,21 @@ function Write-Log {
     <#
         Placeholder since that cmdlet doesnt exist yet (only relevant for unified veeam logging; otherwise the paths for this script log are defined
     #>
+    # Add-VBRJobLogEvent does not appear in Veeam v12/v13 public PS docs; the
+    # -Type parameter name is unverified. Surface a one-time warning on failure
+    # so operators know Veeam job-log integration is broken rather than silent.
     try {
         if (Get-Command Add-VBRJobLogEvent -ErrorAction SilentlyContinue) {
-            Add-VBRJobLogEvent -Message $Message -Type $Level
+            try {
+                Add-VBRJobLogEvent -Message $Message -Type $Level
+            } catch {
+                if (-not $script:VBRLogEventWarned) {
+                    $script:VBRLogEventWarned = $true
+                    $w = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARNING] Add-VBRJobLogEvent failed (verify cmdlet name and -Type param for your Veeam version): $_"
+                    Write-Host $w
+                    try { [System.IO.File]::AppendAllText($logFile, "$w`n") } catch {}
+                }
+            }
         }
     } catch {}
 }
@@ -333,7 +348,9 @@ function Export-ScanResults {
         Findings = @($groupedResults)
     } | ConvertTo-Json -Depth 10
     
-    Set-Content -Path $jsonReport -Value $jsonOutput
+    # Specify UTF8 so non-ASCII characters in matched YARA strings are written
+    # correctly on PS5.1, which defaults to the system ANSI code page otherwise.
+    Set-Content -Path $jsonReport -Value $jsonOutput -Encoding UTF8
     Write-Log "JSON report saved: $jsonReport"
     
     return $groupedResults
