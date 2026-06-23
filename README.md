@@ -1,7 +1,7 @@
 # <a href="https://community.veeam.com/blogs-and-podcasts-57/veeam-malware-detection-a-forensics-analysis-how-to-guide-7829?tid=7829&fid=57">Restore Securely!</a> - Powershell + YARA Rules: <a href="https://community.veeam.com/blogs-and-podcasts-57/veeam-malware-detection-a-forensics-analysis-how-to-guide-7829?tid=7829&fid=57">Enhanced filepath Output w/ hostname</a> for <a href="https://helpcenter.veeam.com/docs/vbr/userguide/scan_backup_yara_log.html?ver=13">VBR/VDPA </a>
 Onion Link & Ransomware Detection [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Veeam YARA Detection](https://i.imgur.com/pEXT1rt.png)
-Designed and tested with Veeam (SecureResore/SureBackup), but many use cases since yara is a framework that is free.
+Designed and tested with Veeam (SecureRestore/SureBackup), but many use cases since yara is a framework that is free.
 A comprehensive malware detection system combining YARA rules with PowerShell automation to detect Tor `.onion` links, ransomware payment portals, and C2 configurations in Veeam backup environments.</center>
 
 **New:** Native PowerShell scanner with detailed onion link extraction and file path reporting for Veeam Secure Restore and SureBackup workflows.
