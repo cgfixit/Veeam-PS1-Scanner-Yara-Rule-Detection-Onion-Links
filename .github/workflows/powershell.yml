@@ -23,6 +23,8 @@ on:
       - '**.ps1'
       - '**.psm1'
       - '**.psd1'
+      - '**.yar'
+      - '**.yara'
       - '.github/workflows/powershell.yml'
   pull_request:
     branches: [ "main" ]
@@ -30,6 +32,8 @@ on:
       - '**.ps1'
       - '**.psm1'
       - '**.psd1'
+      - '**.yar'
+      - '**.yara'
       - '.github/workflows/powershell.yml'
   schedule:
     - cron: '20 7 * * 5'
