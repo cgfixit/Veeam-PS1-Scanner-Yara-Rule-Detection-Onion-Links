@@ -1,0 +1,12 @@
+onion_links_simple [description="Detects any Tor .onion links (broad detection)",author="CG",severity="MEDIUM",category="TOR_INDICATOR"] E:\Users\Administrator\AppData\Local\config.json
+0x19:$onion2: u5sdaz67mvk3yrwx.onion
+0x43:$onion2: u5sdaz67mvk3yrwx.onion
+0x8d:$onion2: u5sdaz67mvk3yrwx.onion
+tor_c2_configuration [description="Detects C2 configs with Tor hidden service endpoints",author="CG",severity="CRITICAL",category="C2_COMMUNICATION"] E:\Users\Administrator\AppData\Local\config.json
+0x19:$onion: u5sdaz67mvk3yrwx.onion
+0x43:$onion: u5sdaz67mvk3yrwx.onion
+0x8d:$onion: u5sdaz67mvk3yrwx.onion
+0x5:$c2_1: c2_server
+0x7a:$c2_4: callback
+0x68:$c2_5: beacon
+0x34:$cfg1: "url":
