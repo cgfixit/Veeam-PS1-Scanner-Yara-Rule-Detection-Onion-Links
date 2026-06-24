@@ -175,8 +175,10 @@ function Send-VeeamOneAlarm {
     )
     if (-not $EnableVeeamOne) { return }
 
-    # Veeam ONE REST API — raises a MalwareDetected alarm visible in the console
-    $uri  = "http://${VeeamOneServer}:${VeeamOnePort}/api/v2.1/alarms"
+    # Veeam ONE REST API — raises a MalwareDetected alarm visible in the console.
+    # Use HTTPS: the alarm payload includes sensitive scan details; plain HTTP
+    # exposes them to network interception on the backup infrastructure segment.
+    $uri  = "https://${VeeamOneServer}:${VeeamOnePort}/api/v2.1/alarms"
     $body = @{
         name    = "MalwareDetected"
         message = $AlarmMessage
@@ -279,7 +281,7 @@ function Invoke-ProcessWithTimeout {
     behaves identically on Windows PowerShell 5.1 and PowerShell 7, with no
     dependency on Start-Job / Start-ThreadJob.
     .OUTPUTS
-    [pscustomobject] @{ TimedOut = [bool]; Output = [string[]] }
+    [pscustomobject] @{ TimedOut = [bool]; ExitCode = [int]; Output = [string[]] }
     #>
     param(
         [string]$FilePath,
@@ -314,6 +316,7 @@ function Invoke-ProcessWithTimeout {
     $errSub = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived  -Action $outHandler -MessageData $sb
 
     $timedOut = $false
+    $exitCode = -1
     try {
         [void]$proc.Start()
         $proc.BeginOutputReadLine()
@@ -326,6 +329,9 @@ function Invoke-ProcessWithTimeout {
         } else {
             # Ensure async buffers are fully flushed after a normal exit.
             try { $proc.WaitForExit() } catch {}
+            # Capture exit code before Dispose() clears it. YARA exit codes:
+            # 0 = match(es) found, 1 = no matches, >1 = error (bad rule, access denied, etc.)
+            try { $exitCode = $proc.ExitCode } catch {}
         }
     } finally {
         Unregister-Event -SourceIdentifier $outSub.Name -ErrorAction SilentlyContinue
@@ -334,7 +340,7 @@ function Invoke-ProcessWithTimeout {
     }
 
     $lines = $sb.ToString() -split "`r?`n" | Where-Object { $_ -ne '' }
-    return [pscustomobject]@{ TimedOut = $timedOut; Output = $lines }
+    return [pscustomobject]@{ TimedOut = $timedOut; ExitCode = $exitCode; Output = $lines }
 }
 
 function Invoke-YARAScan {
@@ -383,6 +389,10 @@ function Invoke-YARAScan {
 
                 if ($result.TimedOut) {
                     Write-Log "WARNING: Scan timed out for $scanPath (rule: $($ruleFile.Name))" -Level "WARNING"
+                } elseif ($result.ExitCode -gt 1) {
+                    # YARA exit codes: 0=match, 1=no match, >1=error (bad rule syntax, permission denied, etc.)
+                    $errDetail = ($result.Output -join '; ').Trim()
+                    Write-Log "ERROR: YARA exited with code $($result.ExitCode) for rule '$($ruleFile.Name)' on '$scanPath'$(if ($errDetail) { ": $errDetail" })" -Level "ERROR"
                 } elseif ($result.Output) {
                     # Parse YARA output
                     $findings = Parse-YARAOutput -Output $result.Output -VolumeRoot $VolumeRoot -VMName $VMName
@@ -512,19 +522,23 @@ function Export-ScanResults {
     }
     
     # Export to JSON
-    $jsonOutput = @{
-        ScanTimestamp = (Get-Date).ToString('o')
-        JobId = $jobId
-        TotalMatches = $AllFindings.Count
-        UniqueFiles = $groupedResults.Count
-        YaraVersion = (& $YaraPath --version 2>&1 | Select-Object -First 1)
-        Findings = @($groupedResults)
-    } | ConvertTo-Json -Depth 10
-    
-    # Specify UTF8 so non-ASCII characters in matched YARA strings are written
-    # correctly on PS5.1, which defaults to the system ANSI code page otherwise.
-    Set-Content -Path $jsonReport -Value $jsonOutput -Encoding UTF8
-    Write-Log "JSON report saved: $jsonReport"
+    try {
+        $jsonOutput = @{
+            ScanTimestamp = (Get-Date).ToString('o')
+            JobId = $jobId
+            TotalMatches = $AllFindings.Count
+            UniqueFiles = $groupedResults.Count
+            YaraVersion = (& $YaraPath --version 2>&1 | Select-Object -First 1)
+            Findings = @($groupedResults)
+        } | ConvertTo-Json -Depth 10
+
+        # Specify UTF8 so non-ASCII characters in matched YARA strings are written
+        # correctly on PS5.1, which defaults to the system ANSI code page otherwise.
+        Set-Content -Path $jsonReport -Value $jsonOutput -Encoding UTF8
+        Write-Log "JSON report saved: $jsonReport"
+    } catch {
+        Write-Log "ERROR: Failed to write JSON report to '${jsonReport}': $_" -Level "ERROR"
+    }
     
     return $groupedResults
 }
