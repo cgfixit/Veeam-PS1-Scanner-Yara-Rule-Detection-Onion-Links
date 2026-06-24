@@ -77,13 +77,41 @@ $script:ParallelMode =
 # each runspace (the object cannot cross a process boundary), so it is opened
 # lazily inside Write-Log rather than passed around. See Write-Log below.
 
-# Initialize logging
-New-Item -ItemType Directory -Path $LogPath -Force | Out-Null
+# ── Test / dot-source guard ──────────────────────────────────────────────────
+# When this file is dot-sourced (e.g. by the Pester suite under tests/) we want
+# the function definitions to load WITHOUT the start-up side effects (log
+# directory creation) or the full volume scan firing. $MyInvocation.InvocationName
+# is '.' only when dot-sourced; the VEEAM_YARA_NOEXEC env var is an explicit
+# import-only override for any other tooling.
+$script:DotSourced = ($MyInvocation.InvocationName -eq '.') -or [bool]$env:VEEAM_YARA_NOEXEC
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $jobId = if ($SessionId) { $SessionId } else { "Manual_$timestamp" }
-$logFile = Join-Path $LogPath "scan_${jobId}_${timestamp}.log"
-$jsonReport = Join-Path $LogPath "results_${jobId}_${timestamp}.json"
+
+# Initialize logging. Creating the log directory can fail (insufficient rights,
+# missing parent, read-only volume); fall back to a temp location and keep going
+# rather than aborting the entire scan before logging is even available.
+if (-not $script:DotSourced) {
+    try {
+        New-Item -ItemType Directory -Path $LogPath -Force -ErrorAction Stop | Out-Null
+    } catch {
+        $fallbackLogPath = Join-Path ([System.IO.Path]::GetTempPath()) "Veeam-YARA-SecureRestore"
+        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARNING] Could not create log directory '$LogPath' ($_); falling back to '$fallbackLogPath'."
+        try {
+            New-Item -ItemType Directory -Path $fallbackLogPath -Force -ErrorAction Stop | Out-Null
+            $LogPath = $fallbackLogPath
+        } catch {
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [ERROR] Could not create fallback log directory '$fallbackLogPath' ($_); file logging disabled."
+        }
+    }
+}
+
+# Use [IO.Path]::Combine rather than Join-Path: Join-Path resolves the path's
+# drive qualifier against the PSDrive list and throws if it is absent (e.g. a
+# "C:\..." default evaluated on a non-Windows test/CI host), whereas Combine is
+# pure string composition and yields identical results on Windows.
+$logFile = [System.IO.Path]::Combine($LogPath, "scan_${jobId}_${timestamp}.log")
+$jsonReport = [System.IO.Path]::Combine($LogPath, "results_${jobId}_${timestamp}.json")
 
 # Flag to emit the Add-VBRJobLogEvent warning only once per run, not on every log call.
 $script:VBRLogEventWarned = $false
@@ -202,24 +230,42 @@ function Get-MountedVMVolumes {
     #>
     
     Write-Log "Discovering mounted VM volumes..."
-    
-    # Get all volumes (mounted VMs appear as standard volumes)
-    $volumes = Get-Volume | Where-Object {
-        $_.DriveLetter -and 
-        $_.FileSystemType -in @('NTFS', 'ReFS') -and
-        $_.DriveLetter -notin @('C')  # Exclude system drive
+
+    # Get all volumes (mounted VMs appear as standard volumes). Get-Volume can
+    # throw on hosts without the Storage module or when WMI/CIM is unhealthy;
+    # treat that as "no volumes" so the caller exits cleanly instead of crashing.
+    try {
+        $volumes = Get-Volume -ErrorAction Stop | Where-Object {
+            $_.DriveLetter -and
+            $_.FileSystemType -in @('NTFS', 'ReFS') -and
+            $_.DriveLetter -notin @('C')  # Exclude system drive
+        }
+    } catch {
+        Write-Log "ERROR: Failed to enumerate volumes via Get-Volume: $_" -Level "ERROR"
+        return @()
     }
-    
+
     $mountedVolumes = @()
-    
+
     foreach ($vol in $volumes) {
         $driveLetter = "$($vol.DriveLetter):\"
-        
-        # Check if this looks like a Windows volume
-        $systemRoot = Join-Path $driveLetter "Windows"
-        $usersDir = Join-Path $driveLetter "Users"
-        
-        if ((Test-Path $systemRoot) -or (Test-Path $usersDir)) {
+
+        # Check if this looks like a Windows volume. Test-Path can throw on a
+        # volume that disappears mid-scan or denies access; skip it rather than
+        # aborting discovery of the remaining volumes. [IO.Path]::Combine (not
+        # Join-Path) avoids Join-Path's PSDrive resolution of the "E:\" qualifier.
+        $systemRoot = [System.IO.Path]::Combine($driveLetter, "Windows")
+        $usersDir = [System.IO.Path]::Combine($driveLetter, "Users")
+
+        $looksWindows = $false
+        try {
+            $looksWindows = (Test-Path $systemRoot) -or (Test-Path $usersDir)
+        } catch {
+            Write-Log "WARNING: Could not probe paths on $driveLetter ($_); skipping volume." -Level "WARNING"
+            continue
+        }
+
+        if ($looksWindows) {
             Write-Log "Found Windows volume: $driveLetter (Size: $([math]::Round($vol.Size/1GB, 2)) GB)"
             
             # Try to identify VM name from volume label
@@ -334,6 +380,13 @@ function Invoke-ProcessWithTimeout {
             # 0 = match(es) found, 1 = no matches, >1 = error (bad rule, access denied, etc.)
             try { $exitCode = $proc.ExitCode } catch {}
         }
+    } catch {
+        # The process failed to start (missing/invalid executable, access denied)
+        # or died mid-lifecycle. Surface it as an error exit code (>1, matching
+        # YARA's error convention) with the message in Output so the caller logs
+        # it cleanly instead of throwing out of the scan loop.
+        [void]$sb.AppendLine("Invoke-ProcessWithTimeout failed to run '$FilePath': $_")
+        $exitCode = 2
     } finally {
         Unregister-Event -SourceIdentifier $outSub.Name -ErrorAction SilentlyContinue
         Unregister-Event -SourceIdentifier $errSub.Name -ErrorAction SilentlyContinue
@@ -424,8 +477,11 @@ function Parse-YARAOutput {
     $currentStrings = @()
     
     foreach ($line in $Output) {
+        # Guard against null entries in the output array (a null .ToString()
+        # would throw and abort parsing of every remaining finding).
+        if ($null -eq $line) { continue }
         $lineStr = $line.ToString().Trim()
-        
+
         # Skip empty lines and errors
         if ([string]::IsNullOrWhiteSpace($lineStr)) { continue }
         if ($lineStr -match '^error:') { continue }
@@ -434,6 +490,15 @@ function Parse-YARAOutput {
         # Match pattern: RuleName FilePath
         # Handles rule names with dots/dashes and paths with spaces
         if ($lineStr -match '^([A-Za-z0-9_.-]+)\s+(.+)$') {
+            # Capture the regex groups IMMEDIATELY. The "save previous finding"
+            # block below runs pipeline -match operations ($_ -match '\.onion')
+            # that overwrite the automatic $Matches variable; reading
+            # $Matches[1]/$Matches[2] after it would yield null and crash
+            # parsing the moment a second rule block appears (i.e. any file that
+            # matches more than one rule).
+            $newRule = $Matches[1]
+            $newFile = $Matches[2].Trim()
+
             # Save previous finding if exists
             if ($currentFile) {
                 $findings += [PSCustomObject]@{
@@ -446,14 +511,12 @@ function Parse-YARAOutput {
                     Timestamp = Get-Date
                 }
             }
-            
-            # Start new finding
-            $currentRule = $Matches[1]
-            $currentFile = $Matches[2].Trim()
-            
-            # Remove metadata/tags if present: "Rule [tags] /path" -> "/path"
-            $currentFile = $currentFile -replace '^\[[^\]]*\]\s*', ''
-            
+
+            # Start new finding. Remove metadata/tags if present:
+            # "Rule [tags] /path" -> "/path"
+            $currentRule = $newRule
+            $currentFile = $newFile -replace '^\[[^\]]*\]\s*', ''
+
             # Reset strings array
             $currentStrings = @()
         }
@@ -489,6 +552,13 @@ function Convert-ToWindowsPath {
         [string]$VolumeRoot
     )
 
+    # Guard against a missing or too-short volume root (e.g. "" or "E"): the
+    # Substring(0,2) below would throw and crash conversion for every finding.
+    # Fall back to returning the original path unchanged.
+    if ([string]::IsNullOrEmpty($VolumeRoot) -or $VolumeRoot.Length -lt 2) {
+        return $MountedPath
+    }
+
     # Return the path under the actual mounted drive letter.
     # VolumeRoot is the letter Veeam assigned (e.g. "E:\"); strip it then
     # re-prefix with that same letter so console and JSON both report E:\...
@@ -505,7 +575,11 @@ function Export-ScanResults {
     if (-not $AllFindings) {
         $AllFindings = @()
     }
-    
+
+    # Drop any null entries a worker may have emitted so Group-Object /
+    # Select-Object below never dereference a null finding.
+    $AllFindings = @($AllFindings | Where-Object { $_ })
+
     # Group findings by file for cleaner output
     $groupedResults = $AllFindings | Group-Object -Property WindowsPath | ForEach-Object {
         $file = $_.Name
@@ -522,6 +596,17 @@ function Export-ScanResults {
         }
     }
     
+    # Probe the YARA version best-effort and OUTSIDE the report-write try: a
+    # missing/erroring yara binary must not prevent a report full of real
+    # findings from being written.
+    $yaraVersion = "unknown"
+    try {
+        $probe = & $YaraPath --version 2>&1 | Select-Object -First 1
+        if ($probe) { $yaraVersion = "$probe".Trim() }
+    } catch {
+        # leave $yaraVersion = "unknown"
+    }
+
     # Export to JSON
     try {
         $jsonOutput = @{
@@ -529,7 +614,7 @@ function Export-ScanResults {
             JobId = $jobId
             TotalMatches = $AllFindings.Count
             UniqueFiles = $groupedResults.Count
-            YaraVersion = (& $YaraPath --version 2>&1 | Select-Object -First 1)
+            YaraVersion = $yaraVersion
             Findings = @($groupedResults)
         } | ConvertTo-Json -Depth 10
 
@@ -657,6 +742,11 @@ function Invoke-VolumeScans {
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
+
+# Skip the scan when the script was only dot-sourced for its functions (tests /
+# tooling). All functions above are now defined in the caller's scope; returning
+# here leaves them available without launching a real scan.
+if ($script:DotSourced) { return }
 
 try {
     Write-Log "=== Veeam YARA Secure Restore Scanner Started ==="

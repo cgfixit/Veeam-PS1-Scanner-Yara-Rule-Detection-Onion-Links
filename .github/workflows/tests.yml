@@ -1,0 +1,65 @@
+# Pester test-suite for the Veeam YARA Secure Restore scanner.
+#
+# Runs the unit / integration / YARA-detection tests under tests/ on every push
+# and pull request that touches the scanner, the YARA rules, or the tests. The
+# YARA-engine tests require the `yara` CLI (installed below); they self-skip if
+# it is somehow unavailable, so the suite never hard-fails on a missing binary.
+
+name: Tests
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - '**.ps1'
+      - '**.psm1'
+      - '**.psd1'
+      - '**.yar'
+      - '**.yara'
+      - 'tests/**'
+      - '.github/workflows/tests.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - '**.ps1'
+      - '**.psm1'
+      - '**.psd1'
+      - '**.yar'
+      - '**.yara'
+      - 'tests/**'
+      - '.github/workflows/tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pester:
+    name: Pester (PowerShell + YARA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The YARA engine backs the fixture-based detection tests. ubuntu-latest
+      # ships pwsh; only the yara CLI needs installing.
+      - name: Install YARA
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends yara
+
+      - name: Show tool versions
+        shell: pwsh
+        run: |
+          yara --version
+          "PowerShell $($PSVersionTable.PSVersion)"
+
+      - name: Run Pester suite
+        shell: pwsh
+        run: |
+          ./tests/Invoke-Tests.ps1 -InstallPester -Output Detailed -ResultsPath testresults.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-test-results
+          path: testresults.xml
+          if-no-files-found: warn

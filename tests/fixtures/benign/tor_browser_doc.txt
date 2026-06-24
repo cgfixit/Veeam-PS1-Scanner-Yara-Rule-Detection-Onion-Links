@@ -1,0 +1,4 @@
+Tor Browser User Guide
+The Tor Browser lets you reach an onion service such as
+3yrwxenctqjop4f2libghu5sdaz67mvk3yrwxenctqjop4f2libghu5s.onion safely. Running a hidden service is a legitimate use of Tor.
+This document is part of our privacy guide for journalists.
