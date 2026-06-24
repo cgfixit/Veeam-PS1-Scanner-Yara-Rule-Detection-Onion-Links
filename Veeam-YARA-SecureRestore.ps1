@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 # Veeam-YARA-SecureRestore.ps1
 # Native Windows YARA scanner for Veeam Secure Restore
 # Extracts matched onion link strings with full file path details
@@ -175,6 +175,7 @@ function Send-VeeamOneAlarm {
     )
     if (-not $EnableVeeamOne) { return }
 
+    # CRITICAL NOTE: THIS veeam one alarm integrstion currently  inexplicably DOESNT REALLY DO ANYTHING DUE TO THERE BEING NO OFFICIAL POST API for VEEAM ONE TO GENERATE AN ALARM BUT I WAS JUST ILLUSTRATONG THE CONCEPT; can still have it post to vbr api or many othrr options
     # Veeam ONE REST API — raises a MalwareDetected alarm visible in the console.
     # Use HTTPS: the alarm payload includes sensitive scan details; plain HTTP
     # exposes them to network interception on the backup infrastructure segment.
