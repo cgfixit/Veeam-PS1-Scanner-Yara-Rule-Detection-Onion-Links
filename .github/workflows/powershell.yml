@@ -78,3 +78,72 @@ jobs:
           name: psscriptanalyzer-sarif
           path: results.sarif
           if-no-files-found: warn
+
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── 1. PowerShell AST parse check ────────────────────────────────────────
+      # Confirms the script has no syntax errors on PS7 and contains none of the
+      # PS7-only parse-breaking operators (??=, ?., &&, ||, ternary) that would
+      # cause a parse failure on Windows PowerShell 5.1.
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $errors = $null; $tokens = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path 'Veeam-YARA-SecureRestore.ps1'),
+              [ref]$tokens, [ref]$errors)
+          if ($errors -and $errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                  Write-Error "Line $($_.Extent.StartLineNumber): $($_.Message)"
+              }
+              exit 1
+          }
+          Write-Host "Parse OK — $($tokens.Count) tokens, 0 errors."
+
+          # Static check for PS7-only parse-breaking operators.
+          # These parse cleanly in PS7 but fail under Windows PowerShell 5.1.
+          $content = Get-Content 'Veeam-YARA-SecureRestore.ps1' -Raw
+          $ps7only = @{
+              'null-coalescing ??'   = '\?\?[^?]'
+              'null-assignment ??='  = '\?\?='
+              'null-conditional ?.'  = '\?\.'
+              'pipeline chain && ||' = '(\|\||(?<![|])&&(?![|]))'
+          }
+          $found = @()
+          foreach ($label in $ps7only.Keys) {
+              if ($content -match $ps7only[$label]) { $found += $label }
+          }
+          if ($found) {
+              Write-Error "PS7-only operators detected (break on PS5.1): $($found -join ', ')"
+              exit 1
+          }
+          Write-Host "No PS7-only parse-breaking operators found."
+
+      # ── 2. YARA rule syntax validation ───────────────────────────────────────
+      # Compiles all .yara / .yar rule files to catch syntax errors before they
+      # silently produce empty scan results at runtime. YARA exit codes:
+      # 0 = match found, 1 = no matches, >1 = error. Scanning /dev/null should
+      # return 1 (no matches); any other exit signals a rule syntax problem.
+      - name: Install YARA
+        run: sudo apt-get install -y --no-install-recommends yara
+
+      - name: YARA rule syntax check
+        run: |
+          fail=0
+          for f in $(find . -name '*.yar' -o -name '*.yara'); do
+            yara -w "$f" /dev/null
+            code=$?
+            if [ $code -gt 1 ]; then
+              echo "::error file=$f::YARA rule syntax error (exit $code): $f"
+              fail=1
+            else
+              echo "OK: $f"
+            fi
+          done
+          exit $fail
