@@ -205,6 +205,21 @@ Describe 'Get-ScanTargets' {
     }
 }
 
+Describe 'Invoke-YARAScan' {
+
+    It 'falls back to YaraRulesPath when no pre-resolved rules are passed' {
+        $YaraRulesPath = Join-Path $TestDrive 'empty-rules'
+        $logFile = Join-Path $TestDrive 'invoke-yara.log'
+        New-Item -ItemType Directory -Force -Path $YaraRulesPath | Out-Null
+
+        { $script:yaraResult = Invoke-YARAScan -ScanPaths @($TestDrive) -VolumeRoot $TestDrive -VMName 'VM1' } |
+            Should -Not -Throw
+
+        $script:yaraResult | Should -BeNullOrEmpty
+        Get-Content $logFile -Raw | Should -Match 'No YARA rules found'
+    }
+}
+
 Describe 'Export-ScanResults' {
 
     BeforeEach {

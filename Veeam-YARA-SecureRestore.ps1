@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 # Veeam-YARA-SecureRestore.ps1
 # Native Windows YARA scanner for Veeam Secure Restore
 # Extracts matched onion link strings with full file path details
@@ -401,13 +401,18 @@ function Invoke-YARAScan {
     param(
         [string[]]$ScanPaths,
         [string]$VolumeRoot,
-        [string]$VMName
+        [string]$VMName,
+        [object[]]$YaraRuleFiles
     )
     
     Write-Log "Starting YARA scan on: $VolumeRoot (VM: $VMName)"
     
-    # Get all YARA rule files
-    $yaraRules = Get-ChildItem -Path $YaraRulesPath -Filter "*.yar*" -File
+    # Use pre-resolved rules when the caller has them so each worker does not
+    # rescan the same rules directory.
+    $yaraRules = @($YaraRuleFiles | Where-Object { $_ })
+    if ($yaraRules.Count -eq 0) {
+        $yaraRules = @(Get-ChildItem -Path $YaraRulesPath -Filter "*.yar*" -File)
+    }
     
     if ($yaraRules.Count -eq 0) {
         Write-Log "ERROR: No YARA rules found in $YaraRulesPath" -Level "ERROR"
@@ -446,7 +451,8 @@ function Invoke-YARAScan {
                 } elseif ($result.ExitCode -gt 1) {
                     # YARA exit codes: 0=match, 1=no match, >1=error (bad rule syntax, permission denied, etc.)
                     $errDetail = ($result.Output -join '; ').Trim()
-                    Write-Log "ERROR: YARA exited with code $($result.ExitCode) for rule '$($ruleFile.Name)' on '$scanPath'$(if ($errDetail) { ": $errDetail" })" -Level "ERROR"
+                    $errSuffix = if ($errDetail) { ": $errDetail" } else { "" }
+                    Write-Log "ERROR: YARA exited with code $($result.ExitCode) for rule '$($ruleFile.Name)' on '$scanPath'$errSuffix" -Level "ERROR"
                 } elseif ($result.Output) {
                     # Parse YARA output
                     $findings = Parse-YARAOutput -Output $result.Output -VolumeRoot $VolumeRoot -VMName $VMName
@@ -613,7 +619,7 @@ function Export-ScanResults {
             ScanTimestamp = (Get-Date).ToString('o')
             JobId = $jobId
             TotalMatches = $AllFindings.Count
-            UniqueFiles = $groupedResults.Count
+            UniqueFiles = @($groupedResults).Count
             YaraVersion = $yaraVersion
             Findings = @($groupedResults)
         } | ConvertTo-Json -Depth 10
@@ -649,7 +655,8 @@ function Invoke-VolumeScans {
     #>
     param(
         [object[]]$Volumes,
-        [int]$Throttle
+        [int]$Throttle,
+        [object[]]$YaraRuleFiles
     )
 
     # Serialise the functions each worker runspace must rebuild from scratch.
@@ -667,7 +674,7 @@ function Invoke-VolumeScans {
     # rebuilt functions read them via normal scope lookup. The named log mutex is
     # re-opened lazily inside Write-Log, so nothing stateful is passed in.
     $worker = {
-        param($volume, $fns, $YaraPath, $YaraRulesPath, $ScanTimeout, $QuickScan, $logFile)
+        param($volume, $fns, $YaraPath, $YaraRulesPath, $ScanTimeout, $QuickScan, $logFile, $YaraRuleFiles)
         foreach ($k in $fns.Keys) {
             Set-Item -Path "function:$k" -Value ([ScriptBlock]::Create($fns[$k]))
         }
@@ -676,7 +683,8 @@ function Invoke-VolumeScans {
         $scanTargets = Get-ScanTargets -VolumeRoot $volume.DriveLetter
         Write-Log "Scan targets: $($scanTargets.Count) path(s)"
         $findings = Invoke-YARAScan -ScanPaths $scanTargets `
-                        -VolumeRoot $volume.DriveLetter -VMName $volume.VMName
+                        -VolumeRoot $volume.DriveLetter -VMName $volume.VMName `
+                        -YaraRuleFiles $YaraRuleFiles
         if ($findings) {
             Write-Log "⚠️  Found $($findings.Count) matches in $($volume.DriveLetter)" -Level "WARNING"
         } else {
@@ -691,7 +699,7 @@ function Invoke-VolumeScans {
     # this into the worker's param() positionally; the same array is splatted
     # (@wArgs) for direct sequential invocation.
     function script:Get-WorkerArgs($v) {
-        return ,@($v, $fnTable, $YaraPath, $YaraRulesPath, $ScanTimeout, $QuickScan, $logFile)
+        return ,@($v, $fnTable, $YaraPath, $YaraRulesPath, $ScanTimeout, $QuickScan, $logFile, $YaraRuleFiles)
     }
 
     $all = @()
@@ -768,7 +776,8 @@ try {
         throw "YARA rules directory not found: $YaraRulesPath"
     }
     
-    $ruleCount = (Get-ChildItem -Path $YaraRulesPath -Filter "*.yar*" -File).Count
+    $yaraRules = @(Get-ChildItem -Path $YaraRulesPath -Filter "*.yar*" -File)
+    $ruleCount = $yaraRules.Count
     if ($ruleCount -eq 0) {
         throw "No YARA rules found in $YaraRulesPath"
     }
@@ -787,7 +796,7 @@ try {
     $throttle = [Environment]::ProcessorCount
     Write-Log "Scanning $($volumes.Count) volume(s) (throttle: $throttle)"
 
-    $allFindings = @(Invoke-VolumeScans -Volumes $volumes -Throttle $throttle)
+    $allFindings = @(Invoke-VolumeScans -Volumes $volumes -Throttle $throttle -YaraRuleFiles $yaraRules)
     
     # Display results
     Write-Log ""
