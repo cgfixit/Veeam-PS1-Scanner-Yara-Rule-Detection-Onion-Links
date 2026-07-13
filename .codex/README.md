@@ -9,7 +9,9 @@ Keep the CyClaw-style split:
 
 Available skills:
 
+- `skills/optimize/` - concise, measured scanner and rule workflow optimization
 - `skills/refactor/` - iterative architecture and speed refactor loop for the scanner and rule workflow
+- `skills/verify/` - first-time setup and safe local verification
 
 Codex optimization bias:
 

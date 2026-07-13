@@ -1,17 +1,13 @@
 ---
 name: optimize
 description: >-
-  description: Use for concise generic optimization of existing code repositories. Applies battle-tested patterns to cut technical debt, boost performance, maintainability and security in live codebases across languages. Trigger on audits, refactors, optimization requests or reviews of established repos not greenfield projects.
-  Veeam-PS1-Scanner-Yara-Rule-Detection-Onion-Links. Use when asked to clean up
-  the scanner architecture, simplify the rule workflow, or run a measured
-  optimization loop with verification, review, commits, and tracker updates.
+  Apply a concise, measured optimization pass to the Veeam PowerShell scanner
+  and YARA workflow.
 ---
 
-# optimize
+# Optimize
 
---
-
-# Optimizer Codex
+## Optimizer Codex
 
 Apply these principles to **existing** code repositories. Focus on high-impact, low-risk improvements that compound over time.
 
