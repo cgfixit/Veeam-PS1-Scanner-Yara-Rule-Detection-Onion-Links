@@ -45,7 +45,7 @@ jobs:
             edition: Desktop
           - id: windows-ps7
             os: windows-latest
-            shell: C:\veeam-ci-pwsh-7.6.6\pwsh.exe -NoLogo -NoProfile -NonInteractive -File {0}
+            shell: pwsh
             major: 7
             edition: Core
           - id: ubuntu-ps7
@@ -73,6 +73,7 @@ jobs:
           $executable = Join-Path $destination 'pwsh.exe'
           if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'pwsh.exe was absent from the verified archive.' }
           "VEEAM_TEST_PWSH_PATH=$executable" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $destination | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Assert host and parse all PowerShell sources
         env:
@@ -89,6 +90,9 @@ jobs:
           }
           if ($env:EXPECTED_PS_VERSION -and $PSVersionTable.PSVersion -ne [version]$env:EXPECTED_PS_VERSION) {
               throw "The Windows Core lane must run PowerShell $env:EXPECTED_PS_VERSION."
+          }
+          if ($env:EXPECTED_PS_VERSION -and (Get-Process -Id $PID).Path -ne $env:VEEAM_TEST_PWSH_PATH) {
+              throw 'The Windows Core lane did not launch the verified executable.'
           }
           if (-not [Environment]::Is64BitProcess) { throw 'The suite requires a 64-bit host.' }
           Write-Host "Parsing with PowerShell $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
