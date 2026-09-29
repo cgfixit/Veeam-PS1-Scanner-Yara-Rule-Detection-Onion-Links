@@ -1,24 +1,8 @@
-# Veeam-PS1-Scanner-Yara-Rule-Detection-Onion-Links
-# PowerShell static analysis (PSScriptAnalyzer) for the Veeam YARA Secure Restore scanner.
-#
-# This workflow lints the repository's PowerShell scanner script
-# (Veeam-YARA-SecureRestore.ps1) for security and quality issues, then publishes
-# the findings as SARIF to GitHub's Security > Code scanning dashboard.
-#
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-#
-# https://github.com/microsoft/action-psscriptanalyzer
-# For more information on PSScriptAnalyzer in general, see
-# https://github.com/PowerShell/PSScriptAnalyzer
-
-name: Veeam-PS1-Scanner-Yara-Rule-Detection-Onion-Links
+name: PowerShell and YARA validation
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
     paths:
       - '**.ps1'
       - '**.psm1'
@@ -27,7 +11,7 @@ on:
       - '**.yara'
       - '.github/workflows/powershell.yml'
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
     paths:
       - '**.ps1'
       - '**.psm1'
@@ -44,38 +28,30 @@ permissions:
 
 jobs:
   build:
-    permissions:
-      contents: read # for actions/checkout to fetch code
-      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
-      actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
-    name: PSScriptAnalyzer
+    name: PSScriptAnalyzer SARIF
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
       - name: Run PSScriptAnalyzer
         uses: microsoft/psscriptanalyzer-action@6b2948b1944407914a58661c49941824d149734f
         with:
-          # Check https://github.com/microsoft/action-psscriptanalyzer for more info about the options.
-          # Analyze the entire repository recursively (currently Veeam-YARA-SecureRestore.ps1).
           path: .\
           recurse: true
-          # Security-focused rule set tailored to a YARA scanner that shells out to
-          # yara64.exe, runs background jobs, and handles file paths / session IDs.
-          # Remove this option to run the full default PSScriptAnalyzer rule set.
           includeRule: '"PSAvoidGlobalAliases", "PSAvoidUsingConvertToSecureStringWithPlainText", "PSAvoidUsingPlainTextForPassword", "PSAvoidUsingInvokeExpression", "PSUsePSCredentialType", "PSAvoidUsingComputerNameHardcoded", "PSAvoidUsingUsernameAndPasswordParams"'
           output: results.sarif
 
-      # Upload the SARIF file generated in the previous step
-      - name: Upload SARIF results file
+      - name: Upload SARIF results
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
 
-      # Fallback: also publish the raw SARIF as a build artifact so findings stay
-      # accessible even if code-scanning upload is unavailable (e.g. a private
-      # repo without GitHub Advanced Security). Runs regardless of prior outcome.
-      - name: Upload SARIF as build artifact
+      - name: Upload SARIF artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -84,70 +60,56 @@ jobs:
           if-no-files-found: warn
 
   validate:
-    name: Validate
+    name: Blocking lint and rule compilation
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      # ── 1. PowerShell AST parse check ────────────────────────────────────────
-      # Confirms the script has no syntax errors on PS7 and contains none of the
-      # PS7-only parse-breaking operators (??=, ?., &&, ||, ternary) that would
-      # cause a parse failure on Windows PowerShell 5.1.
-      - name: PowerShell syntax check
+      - name: Reject analyzer errors and security findings
         shell: pwsh
         run: |
-          $errors = $null; $tokens = $null
-          $null = [System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path 'Veeam-YARA-SecureRestore.ps1'),
-              [ref]$tokens, [ref]$errors)
-          if ($errors -and $errors.Count -gt 0) {
-              $errors | ForEach-Object {
-                  Write-Error "Line $($_.Extent.StartLineNumber): $($_.Message)"
-              }
-              exit 1
+          $ErrorActionPreference = 'Stop'
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Repository PSGallery -Force -Scope CurrentUser
+          Import-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -ErrorAction Stop
+          $securityRules = @(
+              'PSAvoidGlobalAliases',
+              'PSAvoidUsingConvertToSecureStringWithPlainText',
+              'PSAvoidUsingPlainTextForPassword',
+              'PSAvoidUsingInvokeExpression',
+              'PSUsePSCredentialType',
+              'PSAvoidUsingComputerNameHardcoded',
+              'PSAvoidUsingUsernameAndPasswordParams'
+          )
+          $findings = @(
+              Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+              Invoke-ScriptAnalyzer -Path . -Recurse -IncludeRule $securityRules
+          ) | Sort-Object ScriptPath, Line, RuleName -Unique
+          if ($findings) {
+              $findings | Format-Table ScriptName, Line, RuleName, Message -AutoSize -Wrap | Out-String | Write-Host
+              throw "$(@($findings).Count) blocking PowerShell analyzer finding(s)."
           }
-          Write-Host "Parse OK — $($tokens.Count) tokens, 0 errors."
 
-          # Static check for PS7-only parse-breaking operators.
-          # These parse cleanly in PS7 but fail under Windows PowerShell 5.1.
-          $content = Get-Content 'Veeam-YARA-SecureRestore.ps1' -Raw
-          $ps7only = @{
-              'null-coalescing ??'   = '\?\?[^?]'
-              'null-assignment ??='  = '\?\?='
-              'null-conditional ?.'  = '\?\.'
-              'pipeline chain && ||' = '(\|\||(?<![|])&&(?![|]))'
-          }
-          $found = @()
-          foreach ($label in $ps7only.Keys) {
-              if ($content -match $ps7only[$label]) { $found += $label }
-          }
-          if ($found) {
-              Write-Error "PS7-only operators detected (break on PS5.1): $($found -join ', ')"
-              exit 1
-          }
-          Write-Host "No PS7-only parse-breaking operators found."
-
-      # ── 2. YARA rule syntax validation ───────────────────────────────────────
-      # Compiles all .yara / .yar rule files to catch syntax errors before they
-      # silently produce empty scan results at runtime. YARA exit codes:
-      # 0 = match found, 1 = no matches, >1 = error. Scanning /dev/null should
-      # return 1 (no matches); any other exit signals a rule syntax problem.
       - name: Install YARA
-        run: sudo apt-get install -y --no-install-recommends yara
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends yara
 
-      - name: YARA rule syntax check
+      - name: Compile every YARA rule file
+        shell: bash
         run: |
-          fail=0
-          for f in $(find . -name '*.yar' -o -name '*.yara'); do
-            yara -w "$f" /dev/null
-            code=$?
-            if [ $code -gt 1 ]; then
-              echo "::error file=$f::YARA rule syntax error (exit $code): $f"
-              fail=1
+          failed=0
+          count=0
+          while IFS= read -r -d '' rule; do
+            count=$((count + 1))
+            if yara -w "$rule" /dev/null; then
+              echo "Compiled: $rule"
             else
-              echo "OK: $f"
+              echo "::error file=$rule::YARA rule compilation failed"
+              failed=1
             fi
-          done
-          exit $fail
+          done < <(find . -type f \( -name '*.yar' -o -name '*.yara' \) -print0)
+          if [ "$count" -eq 0 ]; then
+            echo '::error::No YARA rule files were found'
+            exit 1
+          fi
+          exit "$failed"
