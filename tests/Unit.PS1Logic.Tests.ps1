@@ -1,4 +1,4 @@
-#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
+﻿#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 <#
     Unit.PS1Logic.Tests.ps1
     ------------------------
@@ -203,20 +203,44 @@ Describe 'Get-ScanTargets' {
         # inetpub\wwwroot was never created, so it must not appear
         ($t | Where-Object { $_ -like '*inetpub*' })       | Should -BeNullOrEmpty
     }
+    It 'expands user-directory wildcards into literal existing directory paths' {
+        $QuickScan = [switch]$true
+        $documents = (Get-Item -LiteralPath (Join-Path $script:VolRoot 'Users\alice\Documents')).FullName
+        $targets = @(Get-ScanTargets -VolumeRoot $script:VolRoot)
+
+        $targets | Should -Contain $documents
+        @($targets | Where-Object { $_ -match '[*?]' }) | Should -HaveCount 0
+        foreach ($target in $targets) {
+            Test-Path -LiteralPath $target -PathType Container | Should -BeTrue
+        }
+    }
+}
+
+Describe 'Quick scan preserves the literal mounted root' {
+    It 'never scans a wildcard-matching sibling of a bracketed root' {
+        $QuickScan = $true
+        $literalRoot = Join-Path $TestDrive 'restore[1]'
+        $siblingRoot = Join-Path $TestDrive 'restore1'
+        $literalTarget = Join-Path $literalRoot 'Windows/Temp'
+        $siblingTarget = Join-Path $siblingRoot 'Windows/Temp'
+        [IO.Directory]::CreateDirectory($literalTarget) | Out-Null
+        [IO.Directory]::CreateDirectory($siblingTarget) | Out-Null
+        $targets = @(Get-ScanTargets -VolumeRoot $literalRoot)
+        $targets | Should -Contain $literalTarget
+        $targets | Should -Not -Contain $siblingTarget
+        $targets | Should -HaveCount 1
+    }
 }
 
 Describe 'Invoke-YARAScan' {
 
-    It 'falls back to YaraRulesPath when no pre-resolved rules are passed' {
+    It 'rejects an empty fallback rules directory instead of reporting a clean scan' {
         $YaraRulesPath = Join-Path $TestDrive 'empty-rules'
         $logFile = Join-Path $TestDrive 'invoke-yara.log'
         New-Item -ItemType Directory -Force -Path $YaraRulesPath | Out-Null
 
-        { $script:yaraResult = Invoke-YARAScan -ScanPaths @($TestDrive) -VolumeRoot $TestDrive -VMName 'VM1' } |
-            Should -Not -Throw
-
-        $script:yaraResult | Should -BeNullOrEmpty
-        Get-Content $logFile -Raw | Should -Match 'No YARA rules found'
+        { Invoke-YARAScan -ScanPaths @($TestDrive) -VolumeRoot $TestDrive -VMName 'VM1' } |
+            Should -Throw '*No YARA rules found*'
     }
 }
 
@@ -274,12 +298,10 @@ Describe 'Invoke-ProcessWithTimeout' {
             $script:Sh = "$env:SystemRoot\System32\cmd.exe"
             $script:EchoArgs    = @('/c','echo','PROC_MARKER')
             $script:SleepArgs   = @('/c','ping','-n','10','127.0.0.1')
-            $script:Exit3Args   = @('/c','exit','3')
         } else {
             $script:Sh = '/bin/sh'
             $script:EchoArgs    = @('-c','echo PROC_MARKER')
             $script:SleepArgs   = @('-c','sleep 10')
-            $script:Exit3Args   = @('-c','exit 3')
         }
     }
 
@@ -290,8 +312,24 @@ Describe 'Invoke-ProcessWithTimeout' {
         ($r.Output -join "`n") | Should -Match 'PROC_MARKER'
     }
 
+    It 'keeps stderr diagnostics separate from stdout match data' {
+        $child = Join-Path $TestDrive 'streams.ps1'
+        Set-Content -LiteralPath $child -Value @'
+[Console]::Out.WriteLine('STDOUT_MARKER')
+[Console]::Error.WriteLine('STDERR_MARKER')
+'@
+        $hostExe = (Get-Process -Id $PID).Path
+        $result = Invoke-ProcessWithTimeout -FilePath $hostExe `
+            -Arguments @('-NoProfile', '-File', $child) -TimeoutSeconds 30
+
+        $result.ExitCode | Should -Be 0
+        $result.Output | Should -Be @('STDOUT_MARKER')
+        $result.StandardError | Should -Be @('STDERR_MARKER')
+    }
+
     It 'reports a non-zero exit code' {
-        $r = Invoke-ProcessWithTimeout -FilePath $script:Sh -Arguments $script:Exit3Args -TimeoutSeconds 30
+        $hostExe = (Get-Process -Id $PID).Path
+        $r = Invoke-ProcessWithTimeout -FilePath $hostExe -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 3') -TimeoutSeconds 30
         $r.TimedOut | Should -BeFalse
         $r.ExitCode | Should -Be 3
     }
@@ -306,7 +344,8 @@ Describe 'Invoke-ProcessWithTimeout' {
         { $script:r2 = Invoke-ProcessWithTimeout -FilePath $bogus -Arguments @('--version') -TimeoutSeconds 5 } |
             Should -Not -Throw
         $script:r2.ExitCode | Should -BeGreaterThan 1
-        ($script:r2.Output -join "`n") | Should -Match 'failed to run'
+        $script:r2.Output | Should -BeNullOrEmpty
+        ($script:r2.StandardError -join "`n") | Should -Match 'failed to run'
     }
 }
 

@@ -46,6 +46,7 @@ BeforeAll {
     function Get-YaraRuleHits {
         param([string]$RuleFile, [string]$Target)
         $out = & $script:YaraExe -w -r $RuleFile $Target 2>$null
+        $LASTEXITCODE | Should -Be 0 -Because 'a failed YARA invocation must not count as a clean fixture'
         $hits = @()
         foreach ($line in $out) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -57,13 +58,29 @@ BeforeAll {
 
 Describe 'YARA rule file' -Skip:(-not $script:YaraAvailable) {
 
-    It 'compiles cleanly (no syntax errors)' {
+    It 'returns zero with no matches for a valid rule and an empty file' {
         $empty = Join-Path $TestDrive 'empty.bin'
         Set-Content -Path $empty -Value '' -NoNewline
-        & $script:YaraExe -w $script:RuleFile $empty 2>$null | Out-Null
-        # YARA exit codes: 0 = match, 1 = no match, >1 = error. An empty file
-        # should yield "no match" (1); anything >1 means a rule syntax problem.
-        $LASTEXITCODE | Should -BeLessOrEqual 1
+        $output = & $script:YaraExe -w $script:RuleFile $empty 2>$null
+        $LASTEXITCODE | Should -Be 0
+        $output | Should -BeNullOrEmpty
+    }
+    It 'returns one for an invalid rule and rejects that incomplete scan' {
+        $invalidRule = Join-Path $TestDrive 'invalid.yara'
+        $target = Join-Path $TestDrive 'input.txt'
+        Set-Content -LiteralPath $invalidRule -Value 'rule broken { condition: undefined_identifier }'
+        Set-Content -LiteralPath $target -Value 'Synthetic test content.'
+        $result = Invoke-ProcessWithTimeout -FilePath $script:YaraExe `
+            -Arguments @($invalidRule, $target) -TimeoutSeconds 30
+
+        $result.TimedOut | Should -BeFalse
+        $result.ExitCode | Should -Be 1
+        $result.Output | Should -BeNullOrEmpty
+        ($result.StandardError -join ' ') | Should -Match 'undefined identifier'
+
+        $YaraPath = $script:YaraExe
+        { Invoke-YARAScan -ScanPaths @($target) -VolumeRoot $TestDrive -VMName 'INVALID-RULE' `
+            -YaraRuleFiles @((Get-Item -LiteralPath $invalidRule)) } | Should -Throw '*exit 1*'
     }
 }
 
@@ -124,7 +141,8 @@ Describe 'End-to-end: scanner process runner + parser extract .onion IOCs' -Skip
         $res = Invoke-ProcessWithTimeout -FilePath $script:YaraExe `
                 -Arguments @('-r','-s','-m','-w', $script:RuleFile, $target) -TimeoutSeconds 60
         $res.TimedOut | Should -BeFalse
-        $res.ExitCode | Should -Be 0   # 0 = match found
+        $res.ExitCode | Should -Be 0
+        $res.StandardError | Should -BeNullOrEmpty
 
         $findings = Parse-YARAOutput -Output $res.Output -VolumeRoot $script:MalDir -VMName 'FIXTURE-VM'
         $findings.Count | Should -BeGreaterThan 0

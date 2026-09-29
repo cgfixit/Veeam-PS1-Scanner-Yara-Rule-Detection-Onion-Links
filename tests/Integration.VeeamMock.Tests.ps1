@@ -2,14 +2,11 @@
 <#
     Integration.VeeamMock.Tests.ps1
     -------------------------------
-    Drives the scanner against a mocked Veeam Backup & Replication environment
-    (tests/mocks/VeeamMock.psm1) under both deployment profiles:
-
-        VBR 12.3.2  + Windows PowerShell 5.1  (Add-VBRJobLogEvent absent)
-        VBR 13      + PowerShell 7            (Add-VBRJobLogEvent present)
-
-    Covers mounted-volume discovery (filtering + hardening) and the Veeam
-    job-log integration path across versions, including failure handling.
+    Exercises scanner volume discovery and optional logging against synthetic
+    Veeam fixtures. These tests run on the actual test host; fixture version
+    labels are not evidence of Windows PowerShell or VBR runtime compatibility.
+    No VBR version fixture supplies Add-VBRJobLogEvent by default. The optional
+    synthetic hook is enabled explicitly to test capability detection.
 
     Run:  pwsh -NoProfile -Command "Invoke-Pester -Path ./tests/Integration.VeeamMock.Tests.ps1"
 #>
@@ -24,32 +21,6 @@ BeforeAll {
 AfterAll {
     Reset-VeeamMockEnvironment
     Remove-Module VeeamMock -ErrorAction SilentlyContinue
-}
-
-Describe 'Mock Veeam version profiles' {
-
-    It 'VBR 12.3.2 pairs with PowerShell 5.1 and omits Add-VBRJobLogEvent' {
-        Install-VeeamMockEnvironment -Version '12.3.2' | Out-Null
-        $p = Get-VeeamVersionProfile -Version '12.3.2'
-        $p.PairedPSMajor        | Should -Be 5
-        $p.HasAddVBRJobLogEvent  | Should -BeFalse
-        Get-Command Add-VBRJobLogEvent -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
-    }
-
-    It 'VBR 13 pairs with PowerShell 7 and provides Add-VBRJobLogEvent' {
-        Install-VeeamMockEnvironment -Version '13' | Out-Null
-        $p = Get-VeeamVersionProfile -Version '13'
-        $p.PairedPSMajor        | Should -Be 7
-        $p.HasAddVBRJobLogEvent  | Should -BeTrue
-        Get-Command Add-VBRJobLogEvent -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
-    }
-
-    It 'Get-VBRServer reports the version-appropriate build string' {
-        Install-VeeamMockEnvironment -Version '12.3.2' | Out-Null
-        (Get-VBRServer).Version | Should -BeLike '12.3.2.*'
-        Install-VeeamMockEnvironment -Version '13' | Out-Null
-        (Get-VBRServer).Version | Should -BeLike '13.0.*'
-    }
 }
 
 Describe 'Get-MountedVMVolumes discovery (mocked Get-Volume)' {
@@ -67,6 +38,21 @@ Describe 'Get-MountedVMVolumes discovery (mocked Get-Volume)' {
         ($vols | Where-Object DriveLetter -eq 'E:\').VMName | Should -Be 'PROD-DC01'
     }
 
+    It 'excludes the configured system drive even when Windows is not installed on C' {
+        Install-VeeamMockEnvironment -Version '13' | Out-Null
+        Mock -CommandName Test-Path -MockWith { $true }
+        $originalSystemDrive = $env:SystemDrive
+        try {
+            $env:SystemDrive = 'E:'
+            $volumes = @(Get-MountedVMVolumes)
+            $volumes.DriveLetter | Should -Not -Contain 'E:\'
+            $volumes.DriveLetter | Should -Contain 'C:\'
+            $volumes.DriveLetter | Should -Contain 'F:\'
+        } finally {
+            $env:SystemDrive = $originalSystemDrive
+        }
+    }
+
     It 'returns an empty set when only the system drive / non-Windows FS exist' {
         Install-VeeamMockEnvironment -Version '13' -Volumes @(
             (New-MockVolume -DriveLetter 'C' -FileSystemType 'NTFS' -Label 'System'),
@@ -78,25 +64,23 @@ Describe 'Get-MountedVMVolumes discovery (mocked Get-Volume)' {
         $vols | Should -HaveCount 0
     }
 
-    It 'returns an empty array (no throw) when Get-Volume fails — hardening' {
+    It 'rejects failed volume enumeration instead of treating it as an empty scan' {
         Install-VeeamMockEnvironment -Version '13' -ThrowOnGetVolume | Out-Null
-        { $script:r = @(Get-MountedVMVolumes) } | Should -Not -Throw
-        $script:r | Should -HaveCount 0
+        { Get-MountedVMVolumes } | Should -Throw '*Failed to enumerate volumes*'
     }
 
-    It 'skips volumes whose Windows/Users probe is inaccessible — hardening' {
+    It 'rejects an inaccessible volume instead of silently excluding it' {
         Install-VeeamMockEnvironment -Version '13' | Out-Null
         Mock -CommandName Test-Path -MockWith { throw 'access is denied (mock)' }
 
-        { $script:r2 = @(Get-MountedVMVolumes) } | Should -Not -Throw
-        $script:r2 | Should -HaveCount 0   # every probe failed, so every volume is skipped
+        { Get-MountedVMVolumes } | Should -Throw '*Could not probe paths*access is denied*'
     }
 }
 
-Describe 'Veeam job-log integration across versions (Write-Log)' {
+Describe 'Optional logging capability (Write-Log)' {
 
-    It 'VBR 13: forwards the log line to Add-VBRJobLogEvent with message + level' {
-        Install-VeeamMockEnvironment -Version '13' | Out-Null
+    It 'forwards message and level when an optional hook is supplied on <Version>' -ForEach @(@{ Version = '12.3.2' }, @{ Version = '13' }) {
+        Install-VeeamMockEnvironment -Version $Version -EnableLogHook | Out-Null
         $logFile = Join-Path $TestDrive 'v13.log'
         $jobId   = 'V13JOB'
 
@@ -108,8 +92,8 @@ Describe 'Veeam job-log integration across versions (Write-Log)' {
         (Get-Content $logFile -Raw) | Should -Match 'onion link detected'
     }
 
-    It 'VBR 12.3.2: degrades to file/host logging when Add-VBRJobLogEvent is absent' {
-        Install-VeeamMockEnvironment -Version '12.3.2' | Out-Null
+    It 'uses file logging without an invented native hook on <Version>' -ForEach @(@{ Version = '12.3.2' }, @{ Version = '13' }) {
+        Install-VeeamMockEnvironment -Version $Version | Out-Null
         Get-Command Add-VBRJobLogEvent -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
 
         $logFile = Join-Path $TestDrive 'v12.log'
@@ -120,8 +104,8 @@ Describe 'Veeam job-log integration across versions (Write-Log)' {
         (Get-Content $logFile -Raw) | Should -Match 'scan started on v12'
     }
 
-    It 'VBR 13: a failing Add-VBRJobLogEvent is caught — scan logging never throws (hardening)' {
-        Install-VeeamMockEnvironment -Version '13' -ThrowOnVBRLog | Out-Null
+    It 'preserves file logging when the optional hook fails on <Version>' -ForEach @(@{ Version = '12.3.2' }, @{ Version = '13' }) {
+        Install-VeeamMockEnvironment -Version $Version -EnableLogHook -ThrowOnVBRLog | Out-Null
         $logFile = Join-Path $TestDrive 'v13-fail.log'
         $jobId   = 'V13FAIL'
 

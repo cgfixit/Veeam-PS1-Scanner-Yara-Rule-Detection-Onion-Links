@@ -3,19 +3,24 @@
 # Native Windows YARA scanner for Veeam Secure Restore
 # Extracts matched onion link strings with full file path details
 #
-# Dual-version support:
-#   * Primary target  : Windows PowerShell 5.1 (native Windows / Veeam v12 host).
-#   * Accelerated path : PowerShell 7 (or 5.1 + ThreadJob module) for parallel
-#                        per-volume scanning.
-# The script runs correctly on either version; PS7-only features are detected
-# at runtime and used only when available, never required. No PS7-only *syntax*
-# is used in the script body, so it parses cleanly under Windows PowerShell 5.1.
+# Auto mode selects the host for the installed Windows VBR build before scanning.
+# Standalone mode keeps the current host for explicitly managed mount servers.
+# The entire script must parse on Windows PowerShell 5.1 before host selection.
 #
 # NOTE: save this file as UTF-8 *with BOM* — Windows PowerShell 5.1 reads
 # BOM-less files as the system ANSI codepage, which corrupts the box-drawing /
 # emoji characters used in log output.
 
 param(
+    [ValidateSet('Auto', 'Standalone')]
+    [string]$RuntimeMode = 'Auto',
+
+    [switch]$PreflightOnly,
+
+    [Parameter(DontShow=$true)]
+    [ValidateRange(0, 1)]
+    [int]$RuntimeHop = 0,
+
     [Parameter(Mandatory=$false)]
     [string]$YaraPath = "C:\Program Files\YARA\yara64.exe",
     
@@ -29,10 +34,16 @@ param(
     [string]$SessionId,
     
     [Parameter(Mandatory=$false)]
+    [ValidateRange(1, 86400)]
     [int]$ScanTimeout = 3600,  # 1 hour
     
     [Parameter(Mandatory=$false)]
-    [switch]$QuickScan,  # Only scan common malware locations
+    [switch]$QuickScan,
+
+    [string[]]$ScanPath,
+
+    [ValidateSet('Auto', 'Sequential', 'Job', 'ThreadJob')]
+    [string]$ExecutionMode = 'Auto',
 
     # ── Syslog / SIEM integration (opt-in) ──────────────────────────────────
     [Parameter(Mandatory=$false)]
@@ -55,66 +66,192 @@ param(
     [int]$VeeamOnePort = 1239
 )
 
-# ── Runtime capability probe ────────────────────────────────────────────────
-# Decide once which parallelism primitive is available, then cache the result.
-# This is the heart of the "PS5.1-primary, PS7-accelerated" design: nothing is
-# required, everything is detected.
-$script:PSMajor      = $PSVersionTable.PSVersion.Major
-$script:HasThreadJob = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
-if (-not $script:HasThreadJob -and (Get-Module -ListAvailable -Name ThreadJob)) {
-    # PS5.1 can opt in to in-process thread jobs if the ThreadJob module is installed.
-    Import-Module ThreadJob -ErrorAction SilentlyContinue
-    $script:HasThreadJob = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
-}
-$script:HasStartJob  = [bool](Get-Command Start-Job -ErrorAction SilentlyContinue)
-$script:ParallelMode =
-    if     ($script:HasThreadJob) { 'ThreadJob' }   # in-process, shared bag, -ThrottleLimit
-    elseif ($script:HasStartJob)  { 'Job' }         # out-of-process, manual throttle + collect
-    else                          { 'Sequential' }  # last-resort single-threaded
-
-# Named mutex serialises log-file writes across in-process runspaces AND
-# out-of-process Start-Job children. A named mutex must be re-opened by name in
-# each runspace (the object cannot cross a process boundary), so it is opened
-# lazily inside Write-Log rather than passed around. See Write-Log below.
-
-# ── Test / dot-source guard ──────────────────────────────────────────────────
-# When this file is dot-sourced (e.g. by the Pester suite under tests/) we want
-# the function definitions to load WITHOUT the start-up side effects (log
-# directory creation) or the full volume scan firing. $MyInvocation.InvocationName
-# is '.' only when dot-sourced; the VEEAM_YARA_NOEXEC env var is an explicit
-# import-only override for any other tooling.
 $script:DotSourced = ($MyInvocation.InvocationName -eq '.') -or [bool]$env:VEEAM_YARA_NOEXEC
 
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$jobId = if ($SessionId) { $SessionId } else { "Manual_$timestamp" }
+function Get-VbrRuntimeRequirement {
+    param([Parameter(Mandatory)][version]$VbrVersion)
 
-# Initialize logging. Creating the log directory can fail (insufficient rights,
-# missing parent, read-only volume); fall back to a temp location and keep going
-# rather than aborting the entire scan before logging is even available.
-if (-not $script:DotSourced) {
+    if ($VbrVersion.Major -eq 12 -and $VbrVersion.Minor -eq 3 -and $VbrVersion.Build -eq 2) {
+        return [pscustomobject]@{ VbrVersion = $VbrVersion; PSEdition = 'Desktop'; PSMajor = 5; MinimumVersion = [version]'5.1' }
+    }
+    if ($VbrVersion.Major -eq 13 -and $VbrVersion.Minor -eq 0 -and $VbrVersion -ge [version]'13.0.1.180') {
+        return [pscustomobject]@{ VbrVersion = $VbrVersion; PSEdition = 'Core'; PSMajor = 7; MinimumVersion = [version]'7.4.13' }
+    }
+    if ($VbrVersion.Major -eq 13 -and $VbrVersion.Minor -eq 1) {
+        return [pscustomobject]@{ VbrVersion = $VbrVersion; PSEdition = 'Core'; PSMajor = 7; MinimumVersion = [version]'7.6.3' }
+    }
+    throw "Unsupported Windows VBR build '$VbrVersion'. Supported families are 12.3.2, Windows 13.0.1.180 or later 13.0, and 13.1. Review vendor requirements before adding another family."
+}
+
+function Get-InstalledVbrVersion {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        throw 'Automatic VBR discovery requires a Windows VBR server. Use -RuntimeMode Standalone only for an explicitly managed mount server or test environment.'
+    }
+    $baseKey = $null
+    $key = $null
     try {
-        New-Item -ItemType Directory -Path $LogPath -Force -ErrorAction Stop | Out-Null
-    } catch {
-        $fallbackLogPath = Join-Path ([System.IO.Path]::GetTempPath()) "Veeam-YARA-SecureRestore"
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARNING] Could not create log directory '$LogPath' ($_); falling back to '$fallbackLogPath'."
-        try {
-            New-Item -ItemType Directory -Path $fallbackLogPath -Force -ErrorAction Stop | Out-Null
-            $LogPath = $fallbackLogPath
-        } catch {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [ERROR] Could not create fallback log directory '$fallbackLogPath' ($_); file logging disabled."
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $baseKey.OpenSubKey('SOFTWARE\Veeam\Veeam Backup and Replication')
+        if (-not $key) { throw 'The 64-bit Veeam Backup and Replication registry key is missing.' }
+        $corePath = [string]$key.GetValue('CorePath')
+        if ([string]::IsNullOrWhiteSpace($corePath) -or -not [IO.Path]::IsPathRooted($corePath)) {
+            throw 'The Veeam CorePath registry value is missing or is not an absolute installation path.'
         }
+        $binaryPath = Join-Path $corePath 'Veeam.Backup.Service.exe'
+        if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+            throw "The local VBR server binary is missing at '$binaryPath'. A console-only installation is insufficient for automatic server discovery."
+        }
+        $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($binaryPath)
+        if ($info.FileMajorPart -le 0) { throw "The VBR server binary has no usable file version: '$binaryPath'." }
+        $version = [version]::new($info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart)
+        return [pscustomobject]@{ Version = $version; Source = $binaryPath }
+    } finally {
+        if ($key) { $key.Dispose() }
+        if ($baseKey) { $baseKey.Dispose() }
     }
 }
 
-# Use [IO.Path]::Combine rather than Join-Path: Join-Path resolves the path's
-# drive qualifier against the PSDrive list and throws if it is absent (e.g. a
-# "C:\..." default evaluated on a non-Windows test/CI host), whereas Combine is
-# pure string composition and yields identical results on Windows.
-$logFile = [System.IO.Path]::Combine($LogPath, "scan_${jobId}_${timestamp}.log")
-$jsonReport = [System.IO.Path]::Combine($LogPath, "results_${jobId}_${timestamp}.json")
+function Get-CurrentPowerShellRuntime {
+    return [pscustomobject]@{
+        Executable = (Get-Process -Id $PID -ErrorAction Stop).Path
+        Version = [version]$PSVersionTable.PSVersion.ToString().Split('-')[0]
+        PSEdition = [string]$PSVersionTable.PSEdition
+        Is64Bit = [Environment]::Is64BitProcess
+        IsPreview = $PSVersionTable.PSVersion.ToString().Contains('-')
+    }
+}
 
-# Flag to emit the Add-VBRJobLogEvent warning only once per run, not on every log call.
-$script:VBRLogEventWarned = $false
+function Test-PowerShellRuntime {
+    param([Parameter(Mandatory)]$Runtime, [Parameter(Mandatory)]$Requirement)
+    return ($Runtime.Is64Bit -and -not $Runtime.IsPreview -and
+        $Runtime.PSEdition -eq $Requirement.PSEdition -and
+        $Runtime.Version.Major -eq $Requirement.PSMajor -and
+        $Runtime.Version -ge $Requirement.MinimumVersion)
+}
+
+function Get-PowerShellCandidate {
+    param([Parameter(Mandatory)]$Requirement)
+    if ($Requirement.PSEdition -eq 'Desktop') {
+        $systemDirectory = if ([Environment]::Is64BitProcess) { 'System32' } else { 'Sysnative' }
+        return (Join-Path $env:SystemRoot "$systemDirectory\WindowsPowerShell\v1.0\powershell.exe")
+    }
+    $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { [Environment]::GetFolderPath('ProgramFiles') }
+    $paths = @()
+    if ($programFiles) { $paths += Join-Path $programFiles 'PowerShell\7\pwsh.exe' }
+    $baseKey = $null
+    $key = $null
+    try {
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $baseKey.OpenSubKey('SOFTWARE\Microsoft\PowerShellCore\InstalledVersions')
+        if ($key) {
+            foreach ($name in $key.GetSubKeyNames()) {
+                $installed = $key.OpenSubKey($name)
+                try {
+                    $location = [string]$installed.GetValue('InstallLocation')
+                    if ($location -and [IO.Path]::IsPathRooted($location)) { $paths += Join-Path $location 'pwsh.exe' }
+                } finally { if ($installed) { $installed.Dispose() } }
+            }
+        }
+    } finally {
+        if ($key) { $key.Dispose() }
+        if ($baseKey) { $baseKey.Dispose() }
+    }
+    return @($paths | Select-Object -Unique)
+}
+
+function Get-PowerShellRuntime {
+    param([Parameter(Mandatory)][string]$FilePath)
+    if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) { return $null }
+    $probe = '[pscustomobject]@{ Version = $PSVersionTable.PSVersion.ToString(); PSEdition = $PSVersionTable.PSEdition; Is64Bit = [Environment]::Is64BitProcess } | ConvertTo-Json -Compress'
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+    $result = Invoke-ProcessWithTimeout -FilePath $FilePath -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) -TimeoutSeconds 15
+    if ($result.TimedOut -or $result.ExitCode -ne 0) { return $null }
+    try {
+        $data = ($result.Output -join "`n") | ConvertFrom-Json -ErrorAction Stop
+        if ($data.Is64Bit -isnot [bool] -or $data.PSEdition -notin @('Desktop', 'Core') -or [string]::IsNullOrWhiteSpace([string]$data.Version)) { return $null }
+        return [pscustomobject]@{
+            Executable = $FilePath
+            Version = [version]([string]$data.Version).Split('-')[0]
+            PSEdition = [string]$data.PSEdition
+            Is64Bit = $data.Is64Bit
+            IsPreview = ([string]$data.Version).Contains('-')
+        }
+    } catch { return $null }
+}
+
+function Get-RuntimeRelaunchCommand {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Parameters,
+        [Parameter(Mandatory)][string]$WorkingDirectory
+    )
+    $arguments = @{}
+    foreach ($name in $Parameters.Keys) {
+        $value = $Parameters[$name]
+        $arguments[$name] = if ($value -is [System.Management.Automation.SwitchParameter]) { [bool]$value } else { $value }
+    }
+    $arguments['RuntimeHop'] = 1
+    $payload = @{ ScriptPath = $ScriptPath; WorkingDirectory = $WorkingDirectory; Parameters = $arguments } | ConvertTo-Json -Depth 8 -Compress
+    $data = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
+    $command = @'
+try {
+    $payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__')) | ConvertFrom-Json -ErrorAction Stop
+    Set-Location -LiteralPath $payload.WorkingDirectory -ErrorAction Stop
+    $parameters = @{}
+    foreach ($property in $payload.Parameters.PSObject.Properties) { $parameters[$property.Name] = $property.Value }
+    $global:LASTEXITCODE = 2
+    & $payload.ScriptPath @parameters
+    if ($LASTEXITCODE -in @(0, 1, 2)) { exit $LASTEXITCODE }
+    exit 2
+} catch {
+    [Console]::Error.WriteLine("Runtime relaunch failed: $_")
+    exit 2
+}
+'@
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command.Replace('__PAYLOAD__', $data)))
+}
+
+function Invoke-RuntimeRelaunch {
+    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string]$EncodedCommand)
+    $global:LASTEXITCODE = 2
+    & $FilePath -NoLogo -NoProfile -NonInteractive -EncodedCommand $EncodedCommand | Out-Host
+    if ($LASTEXITCODE -in @(0, 1, 2)) { return [int]$LASTEXITCODE }
+    return 2
+}
+
+function Initialize-VbrRuntime {
+    param(
+        [ValidateSet('Auto', 'Standalone')][string]$Mode,
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Parameters,
+        [ValidateRange(0, 1)][int]$Hop
+    )
+    $current = Get-CurrentPowerShellRuntime
+    if ($Mode -eq 'Standalone') {
+        return [pscustomobject]@{ Action = 'Continue'; Mode = $Mode; VbrVersion = $null; VbrVersionSource = $null; Executable = $current.Executable; PowerShellVersion = $current.Version.ToString(); PSEdition = $current.PSEdition; Is64Bit = $current.Is64Bit }
+    }
+    $installed = Get-InstalledVbrVersion
+    $requirement = Get-VbrRuntimeRequirement -VbrVersion $installed.Version
+    if (Test-PowerShellRuntime -Runtime $current -Requirement $requirement) {
+        return [pscustomobject]@{ Action = 'Continue'; Mode = $Mode; VbrVersion = $installed.Version.ToString(); VbrVersionSource = $installed.Source; Executable = $current.Executable; PowerShellVersion = $current.Version.ToString(); PSEdition = $current.PSEdition; Is64Bit = $current.Is64Bit }
+    }
+    if ($Hop -ne 0) {
+        throw "PowerShell remains incompatible after one relaunch. VBR $($installed.Version) requires x64 $($requirement.PSEdition) PowerShell $($requirement.PSMajor), minimum $($requirement.MinimumVersion); current process is $($current.Executable) ($($current.Version))."
+    }
+    foreach ($candidate in @(Get-PowerShellCandidate -Requirement $requirement)) {
+        $runtime = Get-PowerShellRuntime -FilePath $candidate
+        if ($runtime -and (Test-PowerShellRuntime -Runtime $runtime -Requirement $requirement)) {
+            if ($PWD.Provider.Name -ne 'FileSystem') { throw 'Run the scanner from a filesystem working directory before changing PowerShell hosts.' }
+            $encoded = Get-RuntimeRelaunchCommand -ScriptPath $ScriptPath -Parameters $Parameters -WorkingDirectory $PWD.Path
+            if (-not $Parameters['PreflightOnly']) {
+                [Console]::WriteLine("VBR $($installed.Version) requires x64 $($requirement.PSEdition) PowerShell $($requirement.MinimumVersion)+. Relaunching with '$candidate' ($($runtime.Version)).")
+            }
+            $exitCode = Invoke-RuntimeRelaunch -FilePath $candidate -EncodedCommand $encoded
+            return [pscustomobject]@{ Action = 'Exit'; ExitCode = $exitCode }
+        }
+    }
+    throw "No compatible PowerShell host found for VBR $($installed.Version). Install the Veeam-supported x64 $($requirement.PSEdition) PowerShell $($requirement.PSMajor) runtime, minimum $($requirement.MinimumVersion), then rerun. Current host is '$($current.Executable)' ($($current.Version))."
+}
 
 function Write-Log {
     param(
@@ -230,19 +367,16 @@ function Get-MountedVMVolumes {
     #>
     
     Write-Log "Discovering mounted VM volumes..."
+    $systemDrive = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
 
-    # Get all volumes (mounted VMs appear as standard volumes). Get-Volume can
-    # throw on hosts without the Storage module or when WMI/CIM is unhealthy;
-    # treat that as "no volumes" so the caller exits cleanly instead of crashing.
     try {
         $volumes = Get-Volume -ErrorAction Stop | Where-Object {
             $_.DriveLetter -and
             $_.FileSystemType -in @('NTFS', 'ReFS') -and
-            $_.DriveLetter -notin @('C')  # Exclude system drive
+            $_.DriveLetter -ne $systemDrive
         }
     } catch {
-        Write-Log "ERROR: Failed to enumerate volumes via Get-Volume: $_" -Level "ERROR"
-        return @()
+        throw "Failed to enumerate volumes via Get-Volume: $_"
     }
 
     $mountedVolumes = @()
@@ -259,10 +393,9 @@ function Get-MountedVMVolumes {
 
         $looksWindows = $false
         try {
-            $looksWindows = (Test-Path $systemRoot) -or (Test-Path $usersDir)
+            $looksWindows = (Test-Path -LiteralPath $systemRoot -ErrorAction Stop) -or (Test-Path -LiteralPath $usersDir -ErrorAction Stop)
         } catch {
-            Write-Log "WARNING: Could not probe paths on $driveLetter ($_); skipping volume." -Level "WARNING"
-            continue
+            throw "Could not probe paths on $driveLetter : $_"
         }
 
         if ($looksWindows) {
@@ -311,9 +444,14 @@ function Get-ScanTargets {
     
     $scanPaths = @()
     foreach ($target in $targets) {
-        $fullPath = Join-Path $VolumeRoot $target
-        if (Test-Path $fullPath) {
-            $scanPaths += $fullPath
+        $fullPath = Join-Path ([WildcardPattern]::Escape($VolumeRoot)) $target
+        foreach ($resolved in @(Resolve-Path -Path $fullPath -ErrorAction SilentlyContinue -ErrorVariable pathErrors)) {
+            if (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container -ErrorAction Stop) {
+                $scanPaths += $resolved.ProviderPath
+            }
+        }
+        foreach ($pathError in $pathErrors) {
+            if ($pathError.CategoryInfo.Category -ne 'ObjectNotFound') { throw $pathError }
         }
     }
     
@@ -321,80 +459,61 @@ function Get-ScanTargets {
 }
 
 function Invoke-ProcessWithTimeout {
-    <#
-    .SYNOPSIS
-    Runs an external executable with a hard timeout, returning its combined
-    stdout/stderr lines. Version-neutral: uses System.Diagnostics.Process, which
-    behaves identically on Windows PowerShell 5.1 and PowerShell 7, with no
-    dependency on Start-Job / Start-ThreadJob.
-    .OUTPUTS
-    [pscustomobject] @{ TimedOut = [bool]; ExitCode = [int]; Output = [string[]] }
-    #>
     param(
         [string]$FilePath,
         [string[]]$Arguments,
-        [int]$TimeoutSeconds
+        [ValidateRange(1, 86400)][int]$TimeoutSeconds
     )
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName               = $FilePath
+    $psi.FileName = $FilePath
     $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.UseShellExecute        = $false
-    $psi.CreateNoWindow         = $true
-    # NOTE: ProcessStartInfo.ArgumentList is .NET Core 2.1+ only and does NOT
-    # exist on .NET Framework 4.x (Windows PowerShell 5.1). Build a quoted
-    # Arguments string instead so this runs on both runtimes. Quote any token
-    # containing whitespace; YARA rule/scan paths never contain embedded quotes.
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    # .NET Framework lacks ArgumentList. Escape quotes and trailing backslashes
+    # using the Windows native argument convention supported by ProcessStartInfo.
     $psi.Arguments = ($Arguments | ForEach-Object {
-        if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+        '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
     }) -join ' '
-
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
-
-    # Drain stdout/stderr asynchronously so a large match list can't deadlock the
-    # pipe buffer while we wait on the process.
-    $sb = [System.Text.StringBuilder]::new()
-    $outHandler = {
-        if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
-    }
-    $outSub = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action $outHandler -MessageData $sb
-    $errSub = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived  -Action $outHandler -MessageData $sb
-
     $timedOut = $false
     $exitCode = -1
+    $stdout = ''
+    $stderr = ''
     try {
-        [void]$proc.Start()
-        $proc.BeginOutputReadLine()
-        $proc.BeginErrorReadLine()
-
+        if (-not $proc.Start()) { throw 'The process did not start.' }
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
             $timedOut = $true
-            try { $proc.Kill() } catch {}
-            try { [void]$proc.WaitForExit(5000) } catch {}
+            $proc.Kill()
+            if (-not $proc.WaitForExit(5000)) { throw 'The process did not stop after its timeout.' }
         } else {
-            # Ensure async buffers are fully flushed after a normal exit.
-            try { $proc.WaitForExit() } catch {}
-            # Capture exit code before Dispose() clears it. YARA exit codes:
-            # 0 = match(es) found, 1 = no matches, >1 = error (bad rule, access denied, etc.)
-            try { $exitCode = $proc.ExitCode } catch {}
+            $exitCode = $proc.ExitCode
         }
+        if (-not $outTask.Wait(5000) -or -not $errTask.Wait(5000)) {
+            throw 'The process output streams did not close.'
+        }
+        $stdout = $outTask.Result
+        $stderr = $errTask.Result
     } catch {
-        # The process failed to start (missing/invalid executable, access denied)
-        # or died mid-lifecycle. Surface it as an error exit code (>1, matching
-        # YARA's error convention) with the message in Output so the caller logs
-        # it cleanly instead of throwing out of the scan loop.
-        [void]$sb.AppendLine("Invoke-ProcessWithTimeout failed to run '$FilePath': $_")
+        $stderr = "Invoke-ProcessWithTimeout failed to run '$FilePath': $_"
         $exitCode = 2
     } finally {
-        Unregister-Event -SourceIdentifier $outSub.Name -ErrorAction SilentlyContinue
-        Unregister-Event -SourceIdentifier $errSub.Name -ErrorAction SilentlyContinue
         $proc.Dispose()
     }
-
-    $lines = $sb.ToString() -split "`r?`n" | Where-Object { $_ -ne '' }
-    return [pscustomobject]@{ TimedOut = $timedOut; ExitCode = $exitCode; Output = $lines }
+    $lines = @($stdout -split "`r?`n" | Where-Object { $_ -ne '' })
+    $errorLines = @($stderr -split "`r?`n" | Where-Object { $_ -ne '' })
+    return [pscustomobject]@{
+        TimedOut = $timedOut
+        ExitCode = $exitCode
+        Output = $lines
+        StandardError = $errorLines
+    }
 }
 
 function Invoke-YARAScan {
@@ -411,14 +530,14 @@ function Invoke-YARAScan {
     # rescan the same rules directory.
     $yaraRules = @($YaraRuleFiles | Where-Object { $_ })
     if ($yaraRules.Count -eq 0) {
-        $yaraRules = @(Get-ChildItem -Path $YaraRulesPath -Filter "*.yar*" -File)
+        $yaraRules = @(Get-ChildItem -LiteralPath $YaraRulesPath -Filter "*.yar*" -File)
     }
     
     if ($yaraRules.Count -eq 0) {
-        Write-Log "ERROR: No YARA rules found in $YaraRulesPath" -Level "ERROR"
-        return $null
+        throw "No YARA rules found in $YaraRulesPath"
     }
     
+    if (@($ScanPaths).Count -eq 0) { throw "No scan targets found on $VolumeRoot" }
     Write-Log "Using $($yaraRules.Count) YARA rule file(s)"
     
     $allFindings = @()
@@ -446,20 +565,17 @@ function Invoke-YARAScan {
                 $result = Invoke-ProcessWithTimeout -FilePath $YaraPath `
                             -Arguments $yaraArgs -TimeoutSeconds $ScanTimeout
 
-                if ($result.TimedOut) {
-                    Write-Log "WARNING: Scan timed out for $scanPath (rule: $($ruleFile.Name))" -Level "WARNING"
-                } elseif ($result.ExitCode -gt 1) {
-                    # YARA exit codes: 0=match, 1=no match, >1=error (bad rule syntax, permission denied, etc.)
-                    $errDetail = ($result.Output -join '; ').Trim()
-                    $errSuffix = if ($errDetail) { ": $errDetail" } else { "" }
-                    Write-Log "ERROR: YARA exited with code $($result.ExitCode) for rule '$($ruleFile.Name)' on '$scanPath'$errSuffix" -Level "ERROR"
-                } elseif ($result.Output) {
-                    # Parse YARA output
-                    $findings = Parse-YARAOutput -Output $result.Output -VolumeRoot $VolumeRoot -VMName $VMName
+                if ($result.TimedOut) { throw "YARA timed out for '$scanPath' with '$($ruleFile.Name)'." }
+                if ($result.ExitCode -ne 0 -or $result.StandardError) {
+                    throw "YARA failed for '$scanPath' with '$($ruleFile.Name)' (exit $($result.ExitCode)): $($result.StandardError -join '; ')"
+                }
+                if ($result.Output) {
+                    $findings = @(Parse-YARAOutput -Output $result.Output -VolumeRoot $VolumeRoot -VMName $VMName)
+                    if ($findings.Count -eq 0) { throw 'YARA produced output that could not be parsed.' }
                     $allFindings += $findings
                 }
             } catch {
-                Write-Log "ERROR scanning $scanPath : $_" -Level "ERROR"
+                throw "Scan incomplete on '$scanPath': $_"
             }
         }
     }
@@ -558,25 +674,15 @@ function Convert-ToWindowsPath {
         [string]$VolumeRoot
     )
 
-    # Guard against a missing or too-short volume root (e.g. "" or "E"): the
-    # Substring(0,2) below would throw and crash conversion for every finding.
-    # Fall back to returning the original path unchanged.
-    if ([string]::IsNullOrEmpty($VolumeRoot) -or $VolumeRoot.Length -lt 2) {
-        return $MountedPath
-    }
-
-    # Return the path under the actual mounted drive letter.
-    # VolumeRoot is the letter Veeam assigned (e.g. "E:\"); strip it then
-    # re-prefix with that same letter so console and JSON both report E:\...
-    # rather than the previously hard-coded C:\.
-    $relativePath = $MountedPath -replace [regex]::Escape($VolumeRoot), ''
-    $relativePath = $relativePath.TrimStart('\')
-    $driveLetter  = $VolumeRoot.Substring(0, 2)   # e.g. "E:"
-    return "$driveLetter\$relativePath"
+    return $MountedPath
 }
 
 function Export-ScanResults {
-    param([object[]]$AllFindings)
+    param(
+        [object[]]$AllFindings,
+        [ValidateSet('Completed', 'Error')][string]$Status = 'Completed',
+        [string]$ScanError
+    )
     
     if (-not $AllFindings) {
         $AllFindings = @()
@@ -607,8 +713,10 @@ function Export-ScanResults {
     # findings from being written.
     $yaraVersion = "unknown"
     try {
-        $probe = & $YaraPath --version 2>&1 | Select-Object -First 1
-        if ($probe) { $yaraVersion = "$probe".Trim() }
+        $probe = Invoke-ProcessWithTimeout -FilePath $YaraPath -Arguments @('--version') -TimeoutSeconds 10
+        if (-not $probe.TimedOut -and $probe.ExitCode -eq 0 -and $probe.Output) {
+            $yaraVersion = ($probe.Output -join ' ').Trim()
+        }
     } catch {
         # leave $yaraVersion = "unknown"
     }
@@ -622,14 +730,20 @@ function Export-ScanResults {
             UniqueFiles = @($groupedResults).Count
             YaraVersion = $yaraVersion
             Findings = @($groupedResults)
+            Status = $Status
+            Errors = @($ScanError | Where-Object { $_ })
+            ExecutionMode = $script:ParallelMode
+            PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+            Scope = if ($QuickScan) { 'Quick' } else { 'Full' }
+            Runtime = $runtime
         } | ConvertTo-Json -Depth 10
 
         # Specify UTF8 so non-ASCII characters in matched YARA strings are written
         # correctly on PS5.1, which defaults to the system ANSI code page otherwise.
-        Set-Content -Path $jsonReport -Value $jsonOutput -Encoding UTF8
+        Set-Content -LiteralPath $jsonReport -Value $jsonOutput -Encoding UTF8 -ErrorAction Stop
         Write-Log "JSON report saved: $jsonReport"
     } catch {
-        Write-Log "ERROR: Failed to write JSON report to '${jsonReport}': $_" -Level "ERROR"
+        throw "Failed to write JSON report to '${jsonReport}': $_"
     }
     
     return $groupedResults
@@ -680,11 +794,12 @@ function Invoke-VolumeScans {
         }
         Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         Write-Log "Processing volume: $($volume.DriveLetter) (VM: $($volume.VMName))"
-        $scanTargets = Get-ScanTargets -VolumeRoot $volume.DriveLetter
+        $ErrorActionPreference = 'Stop'
+        $scanTargets = @(Get-ScanTargets -VolumeRoot $volume.DriveLetter)
         Write-Log "Scan targets: $($scanTargets.Count) path(s)"
-        $findings = Invoke-YARAScan -ScanPaths $scanTargets `
+        $findings = @(Invoke-YARAScan -ScanPaths $scanTargets `
                         -VolumeRoot $volume.DriveLetter -VMName $volume.VMName `
-                        -YaraRuleFiles $YaraRuleFiles
+                        -YaraRuleFiles $YaraRuleFiles)
         if ($findings) {
             Write-Log "⚠️  Found $($findings.Count) matches in $($volume.DriveLetter)" -Level "WARNING"
         } else {
@@ -703,44 +818,40 @@ function Invoke-VolumeScans {
     }
 
     $all = @()
-
-    switch ($script:ParallelMode) {
-        'ThreadJob' {
-            Write-Log "Scan mode: ThreadJob (in-process, throttle: $Throttle)"
-            $jobs = foreach ($v in $Volumes) {
-                $wArgs = Get-WorkerArgs $v
-                Start-ThreadJob -ScriptBlock $worker -ThrottleLimit $Throttle -ArgumentList $wArgs
-            }
-            $jobs | Wait-Job | Out-Null
-            $all = $jobs | Receive-Job
-            $jobs | Remove-Job -Force
-        }
-        'Job' {
-            Write-Log "Scan mode: Start-Job (out-of-process, throttle: $Throttle)"
-            $queue = [System.Collections.Queue]::new()
-            foreach ($v in $Volumes) { $queue.Enqueue($v) }
-            $running = @()
-            while ($queue.Count -gt 0 -or $running.Count -gt 0) {
-                while ($running.Count -lt $Throttle -and $queue.Count -gt 0) {
-                    $v = $queue.Dequeue()
-                    $wArgs = Get-WorkerArgs $v
-                    $running += Start-Job -ScriptBlock $worker -ArgumentList $wArgs
-                }
-                $null = Wait-Job -Job $running -Any
-                $finished = @($running | Where-Object { $_.State -in 'Completed','Failed','Stopped' })
-                foreach ($f in $finished) {
-                    $all += Receive-Job $f
-                    Remove-Job $f -Force
-                }
-                $running = @($running | Where-Object { $_.State -eq 'Running' })
-            }
-        }
-        default {
-            Write-Log "Scan mode: Sequential (single-threaded fallback)"
-            foreach ($v in $Volumes) {
-                $wArgs = Get-WorkerArgs $v
+    $jobs = @()
+    try {
+        foreach ($v in $Volumes) {
+            $wArgs = Get-WorkerArgs $v
+            if ($script:ParallelMode -eq 'Sequential') {
                 $all += & $worker @wArgs
+                continue
             }
+            if ($script:ParallelMode -eq 'ThreadJob') {
+                $jobs += Start-ThreadJob -ScriptBlock $worker -ThrottleLimit $Throttle -ArgumentList $wArgs -ErrorAction Stop
+            } else {
+                $jobs += Start-Job -ScriptBlock $worker -ArgumentList $wArgs -ErrorAction Stop
+            }
+            if ($jobs.Count -ge $Throttle) {
+                $jobs | Wait-Job -ErrorAction Stop | Out-Null
+                foreach ($job in $jobs) {
+                    if ($job.State -ne 'Completed') { throw "Scan worker ended in state $($job.State): $($job.ChildJobs[0].JobStateInfo.Reason)" }
+                    $all += Receive-Job -Job $job -ErrorAction Stop
+                }
+                $jobs | Remove-Job -Force -ErrorAction Stop
+                $jobs = @()
+            }
+        }
+        if ($jobs.Count -gt 0) {
+            $jobs | Wait-Job -ErrorAction Stop | Out-Null
+            foreach ($job in $jobs) {
+                if ($job.State -ne 'Completed') { throw "Scan worker ended in state $($job.State): $($job.ChildJobs[0].JobStateInfo.Reason)" }
+                $all += Receive-Job -Job $job -ErrorAction Stop
+            }
+        }
+    } finally {
+        foreach ($job in $jobs) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -750,6 +861,64 @@ function Invoke-VolumeScans {
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
+
+if (-not $script:DotSourced) {
+    try {
+        $runtime = Initialize-VbrRuntime -Mode $RuntimeMode -ScriptPath $PSCommandPath -Parameters $PSBoundParameters -Hop $RuntimeHop
+        if ($runtime.Action -eq 'Exit') { exit $runtime.ExitCode }
+        if ($PreflightOnly) {
+            $runtime | ConvertTo-Json -Depth 4
+            exit 0
+        }
+    } catch {
+        [Console]::Error.WriteLine("Runtime preflight failed: $_")
+        exit 2
+    }
+}
+
+$script:PSMajor      = $PSVersionTable.PSVersion.Major
+$script:HasThreadJob = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
+if (-not $script:HasThreadJob -and (Get-Module -ListAvailable -Name ThreadJob)) {
+    # PS5.1 can opt in to in-process thread jobs if the ThreadJob module is installed.
+    Import-Module ThreadJob -ErrorAction SilentlyContinue
+    $script:HasThreadJob = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
+}
+$script:HasStartJob  = [bool](Get-Command Start-Job -ErrorAction SilentlyContinue)
+$script:ParallelMode =
+    if     ($script:HasThreadJob) { 'ThreadJob' }   # in-process, shared bag, -ThrottleLimit
+    elseif ($script:HasStartJob)  { 'Job' }         # out-of-process, manual throttle + collect
+    else                          { 'Sequential' }  # last-resort single-threaded
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss_fff"
+$jobId = if ($SessionId) { $SessionId -replace '[^a-zA-Z0-9_.-]', '_' } else { "Manual_$timestamp" }
+
+# Initialize logging. Creating the log directory can fail (insufficient rights,
+# missing parent, read-only volume); fall back to a temp location and keep going
+# rather than aborting the entire scan before logging is even available.
+if (-not $script:DotSourced) {
+    try {
+        New-Item -ItemType Directory -Path $LogPath -Force -ErrorAction Stop | Out-Null
+    } catch {
+        $fallbackLogPath = Join-Path ([System.IO.Path]::GetTempPath()) "Veeam-YARA-SecureRestore"
+        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARNING] Could not create log directory '$LogPath' ($_); falling back to '$fallbackLogPath'."
+        try {
+            New-Item -ItemType Directory -Path $fallbackLogPath -Force -ErrorAction Stop | Out-Null
+            $LogPath = $fallbackLogPath
+        } catch {
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [ERROR] Could not create fallback log directory '$fallbackLogPath' ($_); file logging disabled."
+        }
+    }
+}
+
+# Use [IO.Path]::Combine rather than Join-Path: Join-Path resolves the path's
+# drive qualifier against the PSDrive list and throws if it is absent (e.g. a
+# "C:\..." default evaluated on a non-Windows test/CI host), whereas Combine is
+# pure string composition and yields identical results on Windows.
+$logFile = [System.IO.Path]::Combine($LogPath, "scan_${jobId}_${timestamp}.log")
+$jsonReport = [System.IO.Path]::Combine($LogPath, "results_${jobId}_${timestamp}.json")
+
+# Flag to emit the Add-VBRJobLogEvent warning only once per run, not on every log call.
+$script:VBRLogEventWarned = $false
 
 # Skip the scan when the script was only dot-sourced for its functions (tests /
 # tooling). All functions above are now defined in the caller's scope; returning
@@ -763,20 +932,27 @@ try {
     Write-Log "Job ID: $jobId"
     Write-Log "Scan Mode: $(if($QuickScan){'Quick'}else{'Full'})"
     
-    # Verify YARA is installed
-    if (-not (Test-Path $YaraPath)) {
+    $ErrorActionPreference = 'Stop'
+    if ($ExecutionMode -ne 'Auto') {
+        if ($ExecutionMode -eq 'ThreadJob' -and -not $script:HasThreadJob) { throw 'ThreadJob was requested but is unavailable.' }
+        if ($ExecutionMode -eq 'Job' -and -not $script:HasStartJob) { throw 'Start-Job was requested but is unavailable.' }
+        $script:ParallelMode = $ExecutionMode
+    }
+    Write-Log "PowerShell $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition); executable $((Get-Process -Id $PID).Path); execution $script:ParallelMode"
+    if (-not (Test-Path -LiteralPath $YaraPath -PathType Leaf)) {
         throw "YARA not found at $YaraPath. Please install YARA for Windows."
     }
     
-    $yaraVersion = & $YaraPath --version 2>&1 | Select-Object -First 1
-    Write-Log "YARA Version: $yaraVersion"
+    $probe = Invoke-ProcessWithTimeout -FilePath $YaraPath -Arguments @('--version') -TimeoutSeconds 10
+    if ($probe.TimedOut -or $probe.ExitCode -ne 0 -or -not $probe.Output) { throw 'YARA version probe failed.' }
+    Write-Log "YARA Version: $($probe.Output -join ' ')"
     
     # Verify YARA rules exist
-    if (-not (Test-Path $YaraRulesPath)) {
+    if (-not (Test-Path -LiteralPath $YaraRulesPath)) {
         throw "YARA rules directory not found: $YaraRulesPath"
     }
     
-    $yaraRules = @(Get-ChildItem -Path $YaraRulesPath -Filter "*.yar*" -File)
+    $yaraRules = @(Get-ChildItem -LiteralPath $YaraRulesPath -Filter "*.yar*" -File)
     $ruleCount = $yaraRules.Count
     if ($ruleCount -eq 0) {
         throw "No YARA rules found in $YaraRulesPath"
@@ -784,15 +960,20 @@ try {
     Write-Log "Found $ruleCount YARA rule file(s)"
     
     # Discover mounted volumes
-    $volumes = Get-MountedVMVolumes
-    
-    if ($volumes.Count -eq 0) {
-        Write-Log "No volumes to scan. Exiting." -Level "WARNING"
-        exit 0
+    if ($ScanPath) {
+        $volumes = @(foreach ($target in $ScanPath) {
+            $resolved = Get-Item -LiteralPath $target -ErrorAction Stop
+            if (-not $resolved.PSIsContainer -or $resolved.PSProvider.Name -ne 'FileSystem') {
+                throw "ScanPath must be a local filesystem directory: $target"
+            }
+            [pscustomobject]@{ DriveLetter = $resolved.FullName; VMName = 'ExplicitTarget' }
+        })
+    } else {
+        $volumes = @(Get-MountedVMVolumes)
     }
+    if ($volumes.Count -eq 0) { throw 'No volumes to scan. Supply -ScanPath with the mounted restore directory.' }
     
-    # Scan all mounted volumes using the best available parallelism tier
-    # (ThreadJob / Start-Job / Sequential — chosen at startup in $script:ParallelMode).
+
     $throttle = [Environment]::ProcessorCount
     Write-Log "Scanning $($volumes.Count) volume(s) (throttle: $throttle)"
 
@@ -816,7 +997,7 @@ try {
         Send-SyslogAlert -Message $alertMsg -Severity 2   # Critical
         Send-VeeamOneAlarm -AlarmMessage $alertMsg -FindingsCount $allFindings.Count
 
-        $results = Export-ScanResults -AllFindings $allFindings
+        $results = @(Export-ScanResults -AllFindings $allFindings)
         
         # Display detailed findings with onion links
         foreach ($result in $results) {
@@ -846,7 +1027,8 @@ try {
         
     } else {
         Write-Log ""
-        Write-Log "✅ SUCCESS: No onion links or malware detected - All volumes clean"
+        $null = Export-ScanResults -AllFindings @()
+        Write-Log "Scan completed. No selected YARA rules matched within the scanned scope."
         Write-Log ""
         Write-Log "Full report: $jsonReport"
         exit 0
@@ -855,5 +1037,7 @@ try {
 } catch {
     Write-Log "FATAL ERROR: $_" -Level "ERROR"
     Write-Log $_.ScriptStackTrace -Level "ERROR"
+    try { $null = Export-ScanResults -AllFindings @() -Status Error -ScanError "$_" }
+    catch { Write-Log "Could not persist the error report: $_" -Level ERROR }
     exit 2
 }

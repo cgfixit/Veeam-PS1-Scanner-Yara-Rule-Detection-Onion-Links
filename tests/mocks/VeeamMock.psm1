@@ -5,26 +5,18 @@
     that Veeam-YARA-SecureRestore.ps1 touches, so the scanner can be integration
     tested on any host (including a Linux CI runner) with no Veeam install.
 
-    Two version profiles are modelled, matching how the scanner is deployed:
+    Version fixtures supply sample VBR 12.3.2 and 13 build strings. They do
+    not prove runtime compatibility or emulate the proprietary Veeam module.
+    Add-VBRJobLogEvent is not a documented VBR 12/13 cmdlet. Tests can enable
+    a synthetic optional hook explicitly with -EnableLogHook to exercise
+    logging capability detection and failure handling on either fixture.
 
-        VBR 12.3.2  — paired with Windows PowerShell 5.1 (the scanner's primary
-                      target). In this build Add-VBRJobLogEvent is NOT part of the
-                      documented cmdlet surface, so the scanner must fall back to
-                      file/host logging. (See the script's own note about the
-                      cmdlet being unverified on v12.)
-
-        VBR 13      — paired with PowerShell 7. Add-VBRJobLogEvent IS available
-                      (with -Message/-Type), so the scanner forwards events to the
-                      Veeam job log.
-
-    The mock injects its cmdlets as GLOBAL functions so the dot-sourced scanner
-    resolves them through normal command discovery (and Get-Command sees
-    Add-VBRJobLogEvent only on the v13 profile). State lives in
-    $global:VeeamMockState so behaviour and recorded calls are assertable.
+    Mock commands are global functions so the scanner can discover them.
+    Recorded calls and injected failures live in $global:VeeamMockState.
 
     Public API:
         Install-VeeamMockEnvironment -Version '12.3.2'|'13' [-Volumes ...]
-                                     [-ThrowOnGetVolume] [-ThrowOnVBRLog]
+                                     [-ThrowOnGetVolume] [-EnableLogHook] [-ThrowOnVBRLog]
         New-MockVolume -DriveLetter E -FileSystemType NTFS -Label 'VM' -SizeGB 80
         Get-VeeamMockState
         Get-VeeamMockVBREvents
@@ -34,19 +26,19 @@
 
 Set-StrictMode -Version Latest
 
-# Version → (paired PowerShell major, whether Add-VBRJobLogEvent exists, build string)
+# Fixture versions describe test data, not the executing PowerShell host.
 $script:VersionProfiles = @{
     '12.3.2' = [pscustomobject]@{
         Version              = '12.3.2'
-        Build                = '12.3.2.1748'
+        Build                = '12.3.2.4854'
         PairedPSMajor        = 5
         HasAddVBRJobLogEvent = $false
     }
     '13' = [pscustomobject]@{
         Version              = '13'
-        Build                = '13.0.0.4967'
+        Build                = '13.0.1.180'
         PairedPSMajor        = 7
-        HasAddVBRJobLogEvent = $true
+        HasAddVBRJobLogEvent = $false
     }
 }
 
@@ -94,6 +86,7 @@ function Install-VeeamMockEnvironment {
         [Parameter(Mandatory)][ValidateSet('12.3.2','13')][string]$Version,
         [object[]]$Volumes,
         [switch]$ThrowOnGetVolume,
+        [switch]$EnableLogHook,
         [switch]$ThrowOnVBRLog
     )
 
@@ -106,7 +99,7 @@ function Install-VeeamMockEnvironment {
         VBREvents            = [System.Collections.Generic.List[object]]::new()
         ThrowOnGetVolume     = [bool]$ThrowOnGetVolume
         ThrowOnVBRLog        = [bool]$ThrowOnVBRLog
-        HasAddVBRJobLogEvent = $verProfile.HasAddVBRJobLogEvent
+        HasAddVBRJobLogEvent = [bool]$EnableLogHook
     }
 
     # ── Get-Volume: present on both VBR versions / both PS hosts ──────────────
@@ -136,8 +129,8 @@ function Install-VeeamMockEnvironment {
         return [pscustomobject]@{ Id = [guid]::NewGuid(); State = 'Working'; Result = 'None' }
     }
 
-    # ── Add-VBRJobLogEvent: ONLY on the VBR 13 profile ────────────────────────
-    if ($verProfile.HasAddVBRJobLogEvent) {
+    # Synthetic hook for optional capability handling, independent of VBR version.
+    if ($EnableLogHook) {
         Set-Item -Path function:global:Add-VBRJobLogEvent -Value {
             [CmdletBinding()]
             param(

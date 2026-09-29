@@ -1,15 +1,8 @@
-# Pester test-suite for the Veeam YARA Secure Restore scanner.
-#
-# Runs the unit / integration / YARA-detection tests under tests/ on every push
-# and pull request that touches the scanner, the YARA rules, or the tests. The
-# YARA-engine tests require the `yara` CLI (installed below); they self-skip if
-# it is somehow unavailable, so the suite never hard-fails on a missing binary.
-
 name: Tests
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
     paths:
       - '**.ps1'
       - '**.psm1'
@@ -19,7 +12,7 @@ on:
       - 'tests/**'
       - '.github/workflows/tests.yml'
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
     paths:
       - '**.ps1'
       - '**.psm1'
@@ -35,31 +28,130 @@ permissions:
 
 jobs:
   pester:
-    name: Pester (PowerShell + YARA)
-    runs-on: ubuntu-latest
+    name: Pester (${{ matrix.id }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-ps51
+            os: windows-latest
+            shell: powershell
+            major: 5
+            edition: Desktop
+          - id: windows-ps7
+            os: windows-latest
+            shell: pwsh
+            major: 7
+            edition: Core
+          - id: ubuntu-ps7
+            os: ubuntu-latest
+            shell: pwsh
+            major: 7
+            edition: Core
     steps:
       - uses: actions/checkout@v4
 
-      # The YARA engine backs the fixture-based detection tests. ubuntu-latest
-      # ships pwsh; only the yara CLI needs installing.
-      - name: Install YARA
+      - name: Install verified PowerShell 7.6.6 on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'powershell-7.6.6-win-x64.zip'
+          $destination = 'C:\veeam-ci-pwsh-7.6.6'
+          $uri = 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/PowerShell-7.6.6-win-x64.zip'
+          $expectedHash = '02fe458be20493fbdf43f61ea20610b811ee6c738ab1676c61b9cfcd1a33c860'
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expectedHash) {
+              throw 'The official PowerShell Windows archive did not match its pinned SHA256.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
+          $executable = Join-Path $destination 'pwsh.exe'
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'pwsh.exe was absent from the verified archive.' }
+          "VEEAM_TEST_PWSH_PATH=$executable" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $destination | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Assert host and parse all PowerShell sources
+        env:
+          EXPECTED_PS_MAJOR: ${{ matrix.major }}
+          EXPECTED_PS_EDITION: ${{ matrix.edition }}
+          EXPECTED_PS_VERSION: ${{ matrix.id == 'windows-ps7' && '7.6.6' || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSVersion.Major -ne [int]$env:EXPECTED_PS_MAJOR -or $PSVersionTable.PSEdition -ne $env:EXPECTED_PS_EDITION) {
+              throw "Unexpected host: $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          }
+          if ($PSVersionTable.PSEdition -eq 'Desktop' -and $PSVersionTable.PSVersion.Minor -ne 1) {
+              throw 'The Desktop lane must run Windows PowerShell 5.1.'
+          }
+          if ($env:EXPECTED_PS_VERSION -and $PSVersionTable.PSVersion -ne [version]$env:EXPECTED_PS_VERSION) {
+              throw "The Windows Core lane must run PowerShell $env:EXPECTED_PS_VERSION."
+          }
+          if ($env:EXPECTED_PS_VERSION -and (Get-Process -Id $PID).Path -ne $env:VEEAM_TEST_PWSH_PATH) {
+              throw 'The Windows Core lane did not launch the verified executable.'
+          }
+          if (-not [Environment]::Is64BitProcess) { throw 'The suite requires a 64-bit host.' }
+          Write-Host "Parsing with PowerShell $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          $files = @(Get-ChildItem -LiteralPath . -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' })
+          if ($files.Count -eq 0) { throw 'No PowerShell source files were found.' }
+          $failures = @()
+          foreach ($file in $files) {
+              $tokens = $null; $parseErrors = $null
+              $null = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors)
+              foreach ($parseError in $parseErrors) {
+                  $failures += "$($file.FullName):$($parseError.Extent.StartLineNumber): $($parseError.Message)"
+              }
+          }
+          if ($failures.Count -gt 0) { throw ($failures -join [Environment]::NewLine) }
+          Write-Host "Parsed $($files.Count) PowerShell files."
+
+      - name: Install YARA on Ubuntu
+        if: runner.os == 'Linux'
+        shell: bash
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends yara
 
-      - name: Show tool versions
+      - name: Install verified YARA on Windows
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          yara --version
-          "PowerShell $($PSVersionTable.PSVersion)"
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'yara-4.5.5-win64.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'yara-4.5.5-win64'
+          $uri = 'https://github.com/VirusTotal/yara/releases/download/v4.5.5/yara-4.5.5-2368-win64.zip'
+          $expectedHash = '352396c8a3d9b31b157a4820abd3b9347fc934a2314cdda8a4f566a5570163e4'
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expectedHash) {
+              throw 'The official YARA Windows archive did not match its pinned SHA256.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $destination 'yara64.exe') -PathType Leaf)) {
+              throw 'The verified YARA archive did not contain yara64.exe.'
+          }
+          $destination | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Run Pester suite
-        shell: pwsh
+      - name: Install optional ThreadJob for Desktop tier coverage
+        if: matrix.id == 'windows-ps51'
+        shell: powershell
         run: |
-          ./tests/Invoke-Tests.ps1 -InstallPester -Output Detailed -ResultsPath testresults.xml
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          Install-Module -Name ThreadJob -RequiredVersion 2.0.3 -Repository PSGallery -Scope CurrentUser -Force
+
+      - name: Run Pester suite with real YARA
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./tests/Invoke-Tests.ps1 -InstallPester -RequireYara -FailOnSkipped -Output Detailed -ResultsPath testresults.xml
+          exit $LASTEXITCODE
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pester-test-results
+          name: pester-${{ matrix.id }}
           path: testresults.xml
           if-no-files-found: warn
