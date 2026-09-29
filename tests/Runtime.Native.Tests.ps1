@@ -19,13 +19,34 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             if (-not $script:NativeCore -or -not (Test-Path -LiteralPath $script:NativeCore -PathType Leaf)) {
                 throw 'Set VEEAM_TEST_PWSH_PATH to an installed x64 PowerShell 7.6.3+ pwsh.exe for native Windows runtime tests.'
             }
+            # Desktop's compiler emits the native version resource inspected by Windows.
+            # Core Add-Type emits managed attributes only, which Unix FileVersionInfo can
+            # read but Windows FileVersionInfo cannot use as the server version.
+            $builder = Join-Path $TestDrive 'Build-VersionFixtures.ps1'
+            Set-Content -LiteralPath $builder -Encoding UTF8 -Value @'
+param([string]$FixtureRoot)
+$ErrorActionPreference = 'Stop'
+foreach ($version in '12.3.2.4854', '13.0.1.180', '13.1.1.18') {
+    $directory = Join-Path $FixtureRoot $version
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    $className = 'VbrVersionFixture_' + [guid]::NewGuid().ToString('N')
+    $code = "using System.Reflection; [assembly: AssemblyFileVersion(`"$version`")] public class $className { }"
+    $libraryPath = Join-Path $directory 'VbrVersionFixture.dll'
+    Add-Type -TypeDefinition $code -OutputAssembly $libraryPath -OutputType Library -ErrorAction Stop
+    Copy-Item -LiteralPath $libraryPath -Destination (Join-Path $directory 'Veeam.Backup.Service.exe') -ErrorAction Stop
+}
+'@
+            $buildResult = Invoke-ProcessWithTimeout -FilePath $script:NativeDesktop -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $builder, '-FixtureRoot', $TestDrive) -TimeoutSeconds 60
+            if ($buildResult.TimedOut -or $buildResult.ExitCode -ne 0) {
+                throw "Native fixture build failed: $($buildResult.StandardError -join '; ')"
+            }
             $script:FixtureDirectories = @{}
             foreach ($version in '12.3.2.4854', '13.0.1.180', '13.1.1.18') {
                 $directory = Join-Path $TestDrive $version
-                New-Item -ItemType Directory -Path $directory -Force | Out-Null
-                $className = 'VbrVersionFixture_' + [guid]::NewGuid().ToString('N')
-                $code = "using System.Reflection; [assembly: AssemblyFileVersion(`"$version`")] public class $className { }"
-                Add-Type -TypeDefinition $code -OutputAssembly (Join-Path $directory 'Veeam.Backup.Service.exe') -OutputType Library -ErrorAction Stop
+                $serverPath = Join-Path $directory 'Veeam.Backup.Service.exe'
+                $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($serverPath)
+                $observed = [version]::new($info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart)
+                if ($observed -ne [version]$version) { throw "Native fixture version mismatch: expected $version, observed $observed at $serverPath." }
                 $script:FixtureDirectories[$version] = $directory
             }
             $key = $script:RegistryBase.CreateSubKey($script:VbrRegistryPath)
@@ -63,7 +84,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $result = Invoke-ProcessWithTimeout -FilePath $exe -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:ScannerPath, '-PreflightOnly', '-LogPath', $logPath) -TimeoutSeconds 90
             } finally { $env:VEEAM_YARA_NOEXEC = $previous }
             $result.TimedOut | Should -BeFalse
-            $result.ExitCode | Should -Be 0 -Because ($result.Output -join "`n")
+            $result.ExitCode | Should -Be 0 -Because ((@($result.Output) + @($result.StandardError)) -join "`n")
             $runtime = ($result.Output -join "`n") | ConvertFrom-Json -ErrorAction Stop
             $runtime.VbrVersion | Should -Be $Build
             $runtime.PSEdition | Should -Be $ExpectedEdition

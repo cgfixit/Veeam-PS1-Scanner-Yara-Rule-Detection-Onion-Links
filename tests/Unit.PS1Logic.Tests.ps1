@@ -298,12 +298,10 @@ Describe 'Invoke-ProcessWithTimeout' {
             $script:Sh = "$env:SystemRoot\System32\cmd.exe"
             $script:EchoArgs    = @('/c','echo','PROC_MARKER')
             $script:SleepArgs   = @('/c','ping','-n','10','127.0.0.1')
-            $script:Exit3Args   = @('/c','exit','3')
         } else {
             $script:Sh = '/bin/sh'
             $script:EchoArgs    = @('-c','echo PROC_MARKER')
             $script:SleepArgs   = @('-c','sleep 10')
-            $script:Exit3Args   = @('-c','exit 3')
         }
     }
 
@@ -330,7 +328,8 @@ Describe 'Invoke-ProcessWithTimeout' {
     }
 
     It 'reports a non-zero exit code' {
-        $r = Invoke-ProcessWithTimeout -FilePath $script:Sh -Arguments $script:Exit3Args -TimeoutSeconds 30
+        $hostExe = (Get-Process -Id $PID).Path
+        $r = Invoke-ProcessWithTimeout -FilePath $hostExe -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 3') -TimeoutSeconds 30
         $r.TimedOut | Should -BeFalse
         $r.ExitCode | Should -Be 3
     }
