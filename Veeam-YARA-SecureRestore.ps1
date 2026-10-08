@@ -890,6 +890,10 @@ function Invoke-VolumeScans {
                 $all += Receive-Job -Job $job -ErrorAction Stop
             }
         }
+    } catch {
+        # Never discard outcomes already collected because job infrastructure
+        # failed later (launch, receive, wait, or cleanup).
+        $all += [pscustomobject]@{ Root = 'Worker infrastructure'; Findings = @(); Errors = @("Scan orchestration failed: $_"); Status = 'Error'; EnumeratedFiles = 0; CompletedFiles = 0; FileRuleAttempts = 0 }
     } finally {
         foreach ($job in $jobs) {
             Stop-Job -Job $job -ErrorAction SilentlyContinue
