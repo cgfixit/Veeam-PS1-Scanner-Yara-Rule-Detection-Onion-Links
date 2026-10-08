@@ -313,50 +313,33 @@ function Send-SyslogAlert {
     )
     if (-not $EnableSyslog) { return }
 
-    # RFC 5424 syslog over UDP — no external module required
-    $facility  = 16   # local0
-    $pri       = ($facility * 8) + $Severity
-    $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-    $hostname  = $env:COMPUTERNAME
-    $appName   = "VeeamYARAScanner"
-    $syslogMsg = "<$pri>1 $timestamp $hostname $appName - - - $Message"
-
-    $udp = [System.Net.Sockets.UdpClient]::new()
+    # UDP submission is not delivery acknowledgement. Bound DNS and send waits.
+    $udp = $null
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($syslogMsg)
-        $udp.Send($bytes, $bytes.Length, $SyslogServer, $SyslogPort) | Out-Null
-        Write-Log "Syslog alert sent to ${SyslogServer}:${SyslogPort}"
+        $lookup = [Net.Dns]::GetHostAddressesAsync($SyslogServer)
+        if (-not $lookup.Wait(5000)) { throw 'Syslog DNS lookup exceeded 5 seconds.' }
+        $address = @($lookup.Result)[0]
+        $udp = [Net.Sockets.UdpClient]::new($address.AddressFamily)
+        $pri = 128 + $Severity
+        $timestamp = (Get-Date).ToUniversalTime().ToString('o')
+        $safeMessage = $Message -replace '[\r\n\x00]', ' '
+        $bytes = [Text.Encoding]::UTF8.GetBytes("<$pri>1 $timestamp - VeeamYARAScanner - - - $safeMessage")
+        $send = $udp.SendAsync($bytes, $bytes.Length, [Net.IPEndPoint]::new($address, $SyslogPort))
+        if (-not $send.Wait(5000)) { throw 'Syslog send exceeded 5 seconds.' }
+        return [pscustomobject]@{ Channel = 'Syslog'; Status = 'Submitted'; Detail = 'UDP submitted; delivery unconfirmed.' }
     } catch {
-        Write-Log "WARNING: Syslog send failed: $_" -Level "WARNING"
-    } finally {
-        $udp.Dispose()
-    }
+        return [pscustomobject]@{ Channel = 'Syslog'; Status = 'Failed'; Detail = "$_" }
+    } finally { if ($udp) { $udp.Dispose() } }
 }
 
 function Send-VeeamOneAlarm {
-    param(
-        [string]$AlarmMessage,
-        [int]$FindingsCount
-    )
+    param([string]$AlarmMessage, [int]$FindingsCount)
     if (-not $EnableVeeamOne) { return }
-
-    # CRITICAL NOTE: THIS veeam one alarm integrstion currently  inexplicably DOESNT REALLY DO ANYTHING DUE TO THERE BEING NO OFFICIAL POST API for VEEAM ONE TO GENERATE AN ALARM BUT I WAS JUST ILLUSTRATONG THE CONCEPT; can still have it post to vbr api or many othrr options
-    # Veeam ONE REST API — raises a MalwareDetected alarm visible in the console.
-    # Use HTTPS: the alarm payload includes sensitive scan details; plain HTTP
-    # exposes them to network interception on the backup infrastructure segment.
-    $uri  = "https://${VeeamOneServer}:${VeeamOnePort}/api/v2.1/alarms"
-    $body = @{
-        name    = "MalwareDetected"
-        message = $AlarmMessage
-        details = "Veeam YARA Secure Restore detected $FindingsCount malware indicator(s). Review before restoring."
-    } | ConvertTo-Json
-
-    try {
-        $null = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
-            -ContentType "application/json" -UseDefaultCredentials
-        Write-Log "Veeam ONE alarm raised at ${VeeamOneServer}:${VeeamOnePort}"
-    } catch {
-        Write-Log "WARNING: Veeam ONE alarm failed: $_" -Level "WARNING"
+    # The former POST /alarms example was an unsupported prototype. Keep the
+    # opt-in parameter compatible, but never claim an alarm was created.
+    return [pscustomobject]@{
+        Channel = 'VeeamONE'; Status = 'Unsupported'
+        Detail = 'No supported alarm-creation API is configured. Use the persisted report with an approved integration.'
     }
 }
 
@@ -641,12 +624,14 @@ function Parse-YARAOutput {
     $currentRule = $null
     $currentFile = $null
     $currentStrings = @()
+    $currentMetadata = @{}
+    $currentEvidence = @()
     
     foreach ($line in $Output) {
         # Guard against null entries in the output array (a null .ToString()
         # would throw and abort parsing of every remaining finding).
         if ($null -eq $line) { continue }
-        $lineStr = $line.ToString().Trim()
+        $lineStr = $line.ToString().TrimEnd("`r", "`n")
 
         # Skip empty lines and errors
         if ([string]::IsNullOrWhiteSpace($lineStr)) { continue }
@@ -675,21 +660,38 @@ function Parse-YARAOutput {
                     MatchedStrings = ($currentStrings | Where-Object { $_ } | Select-Object -Unique) -join ' | '
                     OnionLinks = ($currentStrings | Where-Object { $_ -match '\.onion' } | Select-Object -Unique) -join ' | '
                     Timestamp = Get-Date
+                    Metadata = $currentMetadata
+                    Evidence = @($currentEvidence)
                 }
             }
 
             # Start new finding. Remove metadata/tags if present:
             # "Rule [tags] /path" -> "/path"
             $currentRule = $newRule
-            $currentFile = $newFile -replace '^\[[^\]]*\]\s*', ''
+            $currentFile = $newFile
+            $currentMetadata = @{}
+            $header = [regex]::Match($newFile, '^\[(?<meta>(?:"(?:\\.|[^"\\])*"|[^"\]])*)\]\s+(?<path>.+)$')
+            if ($header.Success) {
+                $currentFile = $header.Groups['path'].Value
+                foreach ($entry in [regex]::Matches($header.Groups['meta'].Value, '(?<key>\w+)=(?<value>"(?:\\.|[^"\\])*"|true|false|-?\d+)')) {
+                    $raw = $entry.Groups['value'].Value
+                    try { $value = ConvertFrom-Json -InputObject $raw -ErrorAction Stop }
+                    catch { $value = $raw } # Preserve unusual vendor escapes verbatim.
+                    $currentMetadata[$entry.Groups['key'].Value] = $value
+                }
+            }
 
             # Reset strings array
             $currentStrings = @()
+            $currentEvidence = @()
         }
         # Match pattern: 0x<offset>:$<identifier>: <matched_string>
         # This captures the actual .onion URLs and other matched strings
-        elseif ($lineStr -match '0x[0-9a-f]+:\$[^:]+:\s*(.+)$') {
-            $matchedString = $Matches[1].Trim()
+        elseif ($lineStr -match '^0x([0-9a-f]+):(\$[^:]+): ?(.*)$') {
+            $offsetValue = [Convert]::ToInt64($Matches[1], 16)
+            $identifier = $Matches[2]
+            $matchedString = $Matches[3]
+            $currentEvidence += [pscustomobject]@{ Identifier = $identifier; Offset = $offsetValue; RawValue = $matchedString }
             if ($matchedString) {
                 $currentStrings += $matchedString
             }
@@ -706,9 +708,24 @@ function Parse-YARAOutput {
             MatchedStrings = ($currentStrings | Where-Object { $_ } | Select-Object -Unique) -join ' | '
             OnionLinks = ($currentStrings | Where-Object { $_ -match '\.onion' } | Select-Object -Unique) -join ' | '
             Timestamp = Get-Date
+            Metadata = $currentMetadata
+            Evidence = @($currentEvidence)
         }
     }
     
+    foreach ($finding in $findings) {
+        $indicators = @()
+        foreach ($evidence in $finding.Evidence) {
+            $text = $evidence.RawValue
+            # Decode only the CLI's unambiguous ASCII-wide representation for
+            # extraction. The original CLI bytes/escapes remain in RawValue.
+            if ($text -cmatch '^(?:[ -~]\\x00)+$') { $text = $text -creplace '\\x00', '' }
+            foreach ($hostMatch in [regex]::Matches($text, '(?i)(?<![a-z0-9_-])(?:[a-z2-7]{16}|[a-z2-7]{56})\.onion(?![a-z0-9_.-])')) {
+                $indicators += $hostMatch.Value.ToLowerInvariant()
+            }
+        }
+        $finding | Add-Member -NotePropertyName Indicators -NotePropertyValue @($indicators | Sort-Object -Unique)
+    }
     return $findings
 }
 
@@ -726,7 +743,8 @@ function Export-ScanResults {
         [object[]]$AllFindings,
         [ValidateSet('Completed', 'Error')][string]$Status = 'Completed',
         [string[]]$ScanError,
-        [object[]]$Coverage = @()
+        [object[]]$Coverage = @(),
+        [object[]]$Notifications = @()
     )
     
     if (-not $AllFindings) {
@@ -750,6 +768,8 @@ function Export-ScanResults {
             OnionLinks = ($group | Select-Object -ExpandProperty OnionLinks | Where-Object {$_} | Sort-Object -Unique) -join ' | '
             MatchedStrings = ($group | Select-Object -ExpandProperty MatchedStrings | Where-Object {$_} | Sort-Object -Unique) -join ' | '
             RuleCount = $group.Count
+            RuleEvidence = @($group | Select-Object Rule, Metadata, Evidence, Indicators)
+            Indicators = @($group | ForEach-Object { $_.Indicators } | Where-Object { $_ } | Sort-Object -Unique)
         }
     }
     
@@ -769,6 +789,9 @@ function Export-ScanResults {
     # Export to JSON
     try {
         $jsonOutput = @{
+            SchemaVersion = 2
+            NotificationStatus = @($Notifications)
+            Assessment = 'Rule indicators only; analyst review required.'
             ScanTimestamp = (Get-Date).ToString('o')
             JobId = $jobId
             TotalMatches = $AllFindings.Count
@@ -786,7 +809,14 @@ function Export-ScanResults {
 
         # Specify UTF8 so non-ASCII characters in matched YARA strings are written
         # correctly on PS5.1, which defaults to the system ANSI code page otherwise.
-        Set-Content -LiteralPath $jsonReport -Value $jsonOutput -Encoding UTF8 -ErrorAction Stop
+        $temporaryReport = "$jsonReport.$([guid]::NewGuid().ToString('N')).tmp"
+        try {
+            [IO.File]::WriteAllText($temporaryReport, $jsonOutput, [Text.UTF8Encoding]::new($false))
+            if ([IO.File]::Exists($jsonReport)) { [IO.File]::Replace($temporaryReport, $jsonReport, [NullString]::Value) }
+            else { [IO.File]::Move($temporaryReport, $jsonReport) }
+        } finally {
+            if (Test-Path -LiteralPath $temporaryReport) { Remove-Item -LiteralPath $temporaryReport -Force -ErrorAction SilentlyContinue }
+        }
         Write-Log "JSON report saved: $jsonReport"
     } catch {
         throw "Failed to write JSON report to '${jsonReport}': $_"
@@ -1042,16 +1072,19 @@ try {
     
     if ($allFindings.Count -gt 0) {
         Write-Log ""
-        Write-Log "⚠️⚠️⚠️  ONION LINKS DETECTED - INFECTED FILES  ⚠️⚠️⚠️" -Level "WARNING"
+        Write-Log "⚠️⚠️⚠️  YARA INDICATORS MATCHED - REVIEW REQUIRED  ⚠️⚠️⚠️" -Level "WARNING"
         Write-Log ""
 
-        # Emit alerts to SIEM and/or Veeam ONE before displaying detail
-        $alertMsg = "MALWARE DETECTED: $($allFindings.Count) YARA match(es) across $($volumes.Count) volume(s). Job: $jobId"
-        Send-SyslogAlert -Message $alertMsg -Severity 2   # Critical
-        Send-VeeamOneAlarm -AlarmMessage $alertMsg -FindingsCount $allFindings.Count
-
+        # Persist primary evidence before any optional network activity.
         $results = @(Export-ScanResults -AllFindings $allFindings -Coverage $scanResults)
-        
+        $alertMsg = "YARA INDICATORS: $($allFindings.Count) match(es) across $($volumes.Count) volume(s). Job: $jobId; review required."
+        $notifications = @()
+        try { $notifications += @(Send-SyslogAlert -Message $alertMsg -Severity 4) }
+        catch { $notifications += [pscustomobject]@{ Channel = 'Syslog'; Status = 'Failed'; Detail = "$_" } }
+        try { $notifications += @(Send-VeeamOneAlarm -AlarmMessage $alertMsg -FindingsCount $allFindings.Count) }
+        catch { $notifications += [pscustomobject]@{ Channel = 'VeeamONE'; Status = 'Failed'; Detail = "$_" } }
+        if ($notifications.Count) { $null = Export-ScanResults -AllFindings $allFindings -Coverage $scanResults -Notifications $notifications }
+
         # Display detailed findings with onion links
         foreach ($result in $results) {
             Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Level "WARNING"
@@ -1071,7 +1104,7 @@ try {
         Write-Log ""
         Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         Write-Log ""
-        Write-Log "⚠️  ACTION REQUIRED: Review infected files before restoring!" -Level "WARNING"
+        Write-Log "⚠️  ACTION REQUIRED: Review matched files before restoring!" -Level "WARNING"
         Write-Log "Full report: $jsonReport"
         Write-Log ""
         
