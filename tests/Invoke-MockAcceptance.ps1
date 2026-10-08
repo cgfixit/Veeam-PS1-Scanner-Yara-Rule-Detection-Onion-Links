@@ -42,6 +42,15 @@ function Invoke-ScannerFixture {
             $parameters.ScanTimeout = 1
             $expected = 2
         }
+        'PartialFailure' {
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/malicious/ransom_note_onion.txt') -Destination $target
+            $missing = Join-Path $caseRoot 'second-target'
+            New-Item -ItemType Directory -Path $missing -Force | Out-Null
+            # A descendant link is rejected while the first root retains its match.
+            New-Item -ItemType SymbolicLink -Path (Join-Path $missing 'outside') -Target $target -ErrorAction Stop | Out-Null
+            $parameters.ScanPath = @($target, $missing)
+            $expected = 2
+        }
         'Clean' {}
         default { throw "Unknown fixture scenario '$Scenario'." }
     }
