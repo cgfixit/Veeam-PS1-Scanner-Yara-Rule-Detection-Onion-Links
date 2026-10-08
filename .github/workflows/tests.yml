@@ -12,7 +12,6 @@ on:
       - 'tests/**'
       - '.github/workflows/tests.yml'
   pull_request:
-    branches: [main]
     paths:
       - '**.ps1'
       - '**.psm1'

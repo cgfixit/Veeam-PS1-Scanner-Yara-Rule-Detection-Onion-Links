@@ -516,74 +516,113 @@ function Invoke-ProcessWithTimeout {
     }
 }
 
+function Get-ScanInventory {
+    param([string]$Root)
+    $files = [Collections.Generic.List[string]]::new()
+    $errors = [Collections.Generic.List[string]]::new()
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($Root)
+    while ($pending.Count) {
+        $path = $pending.Pop()
+        try {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            # The caller explicitly authorizes the starting root. Descendant links
+            # are never followed, including Windows junctions and reparse points.
+            if ($path -ne $Root -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "Descendant link/reparse point is outside the traversal policy: $path"
+            }
+            if ($item.PSIsContainer) {
+                foreach ($child in @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)) {
+                    $pending.Push($child.FullName)
+                }
+            } else {
+                if ($path -match '[\r\n]') { throw "Filename cannot be represented in a YARA scan list: $path" }
+                $files.Add($item.FullName)
+            }
+        } catch { $errors.Add("Cannot inventory '$path': $_") }
+    }
+    [pscustomobject]@{ Files = $files.ToArray(); Errors = $errors.ToArray() }
+}
+
 function Invoke-YARAScan {
     param(
         [string[]]$ScanPaths,
         [string]$VolumeRoot,
         [string]$VMName,
-        [object[]]$YaraRuleFiles
+        [object[]]$YaraRuleFiles,
+        [switch]$Detailed
     )
-    
-    Write-Log "Starting YARA scan on: $VolumeRoot (VM: $VMName)"
-    
-    # Use pre-resolved rules when the caller has them so each worker does not
-    # rescan the same rules directory.
+    $findings = [Collections.Generic.List[object]]::new()
+    $errors = [Collections.Generic.List[string]]::new()
+    $files = [Collections.Generic.List[string]]::new()
+    $comparer = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }
+    $seen = [Collections.Generic.HashSet[string]]::new($comparer)
+    $completed = 0
+    $attempted = 0
     $yaraRules = @($YaraRuleFiles | Where-Object { $_ })
-    if ($yaraRules.Count -eq 0) {
-        $yaraRules = @(Get-ChildItem -LiteralPath $YaraRulesPath -Filter "*.yar*" -File)
-    }
-    
-    if ($yaraRules.Count -eq 0) {
-        throw "No YARA rules found in $YaraRulesPath"
-    }
-    
-    if (@($ScanPaths).Count -eq 0) { throw "No scan targets found on $VolumeRoot" }
-    Write-Log "Using $($yaraRules.Count) YARA rule file(s)"
-    
-    $allFindings = @()
-    $startTime = Get-Date
-    
-    foreach ($scanPath in $ScanPaths) {
-        Write-Log "Scanning: $scanPath"
-        
-        foreach ($ruleFile in $yaraRules) {
-            # Build YARA command with matched string output
-            # -r = recursive, -s = show matched strings (CRITICAL), -m = metadata
-            $yaraArgs = @(
-                "-r",
-                "-s",  # This extracts the actual .onion URLs
-                "-m",
-                "-w",  # no warnings
-                $ruleFile.FullName,
-                $scanPath
-            )
-            
-            try {
-                # Execute YARA with a hard timeout via a plain external process.
-                # This is version-neutral (no Start-Job / Start-ThreadJob), so it
-                # runs identically on Windows PowerShell 5.1 and PowerShell 7.
-                $result = Invoke-ProcessWithTimeout -FilePath $YaraPath `
-                            -Arguments $yaraArgs -TimeoutSeconds $ScanTimeout
-
-                if ($result.TimedOut) { throw "YARA timed out for '$scanPath' with '$($ruleFile.Name)'." }
-                if ($result.ExitCode -ne 0 -or $result.StandardError) {
-                    throw "YARA failed for '$scanPath' with '$($ruleFile.Name)' (exit $($result.ExitCode)): $($result.StandardError -join '; ')"
+    try {
+        if (-not $yaraRules.Count) { $yaraRules = @(Get-ChildItem -LiteralPath $YaraRulesPath -Filter '*.yar*' -File -ErrorAction Stop) }
+        if (-not $yaraRules.Count) { throw "No YARA rules found in $YaraRulesPath" }
+        if (-not @($ScanPaths).Count) { throw "No scan targets found on $VolumeRoot" }
+        foreach ($scanPath in $ScanPaths) {
+            $inventory = Get-ScanInventory -Root $scanPath
+            foreach ($failure in $inventory.Errors) { $errors.Add($failure) }
+            foreach ($file in $inventory.Files) {
+                if ($QuickScan) {
+                    $relative = $file.Substring($VolumeRoot.TrimEnd('\','/').Length).TrimStart('\','/').Replace('\','/')
+                    $selected = $false
+                    foreach ($pattern in @('Users/*/Documents/*','Users/*/Desktop/*','Users/*/Downloads/*','Users/*/AppData/Local/Temp/*','Users/*/AppData/Roaming/*','Windows/Temp/*','ProgramData/*','inetpub/wwwroot/*','Windows/System32/config/*')) {
+                        if ($relative -like $pattern) { $selected = $true; break }
+                    }
+                    if (-not $selected) { continue }
                 }
-                if ($result.Output) {
-                    $findings = @(Parse-YARAOutput -Output $result.Output -VolumeRoot $VolumeRoot -VMName $VMName)
-                    if ($findings.Count -eq 0) { throw 'YARA produced output that could not be parsed.' }
-                    $allFindings += $findings
-                }
-            } catch {
-                throw "Scan incomplete on '$scanPath': $_"
+                if ($seen.Add($file)) { $files.Add($file) }
             }
         }
+        if ($QuickScan -and -not $files.Count) { throw "No QuickScan files found on $VolumeRoot. Supply each mounted disk root explicitly, or use a full scan." }
+        # An empty readable root is a completed zero-file scope, but rules must
+        # still compile. Never let an empty mount hide an invalid rule pack.
+        $empty = $null
+        $scanFiles = $files.ToArray()
+        if (-not $files.Count) {
+            $empty = [IO.Path]::GetTempFileName()
+            $scanFiles = @($empty)
+        }
+        try {
+            for ($offset = 0; $offset -lt $scanFiles.Count; $offset += 128) {
+                $batch = @($scanFiles[$offset..([Math]::Min($offset + 127, $scanFiles.Count - 1))])
+                $list = [IO.Path]::GetTempFileName()
+                try {
+                    [IO.File]::WriteAllLines($list, [string[]]$batch, [Text.UTF8Encoding]::new($false))
+                    $batchComplete = $true
+                    foreach ($ruleFile in $yaraRules) {
+                        if (-not $empty) { $attempted += $batch.Count }
+                        $result = Invoke-ProcessWithTimeout -FilePath $YaraPath -Arguments @('--scan-list','--no-follow-symlinks','-p','1','-s','-m','-w',$ruleFile.FullName,$list) -TimeoutSeconds $ScanTimeout
+                        # Preserve available findings even when another file in
+                        # the same batch failed. stderr is authoritative too.
+                        if ($result.Output -and -not $empty) {
+                            $parsed = @(Parse-YARAOutput -Output $result.Output -VolumeRoot $VolumeRoot -VMName $VMName)
+                            foreach ($finding in $parsed) { $findings.Add($finding) }
+                            if (-not $parsed.Count) { $errors.Add('YARA produced output that could not be parsed.'); $batchComplete = $false }
+                        }
+                        if ($result.TimedOut -or $result.ExitCode -ne 0 -or $result.StandardError) {
+                            $errors.Add("YARA failed for '$VolumeRoot' with '$($ruleFile.Name)' (exit $($result.ExitCode), timed out: $($result.TimedOut)): $($result.StandardError -join '; ')")
+                            $batchComplete = $false
+                        }
+                    }
+                    if ($batchComplete -and -not $empty) { $completed += $batch.Count }
+                } finally { Remove-Item -LiteralPath $list -Force -ErrorAction SilentlyContinue }
+            }
+        } finally { if ($empty) { Remove-Item -LiteralPath $empty -Force -ErrorAction SilentlyContinue } }
+    } catch { $errors.Add("Scan incomplete on '$VolumeRoot': $_") }
+    $result = [pscustomobject]@{
+        Root = $VolumeRoot; Findings = $findings.ToArray(); Errors = $errors.ToArray()
+        EnumeratedFiles = $files.Count; CompletedFiles = $completed; FileRuleAttempts = $attempted
+        Status = if ($errors.Count) { 'Error' } else { 'Completed' }
     }
-    
-    $duration = ((Get-Date) - $startTime).TotalSeconds
-    Write-Log "Scan completed in $duration seconds"
-    
-    return $allFindings
+    if ($Detailed) { return $result }
+    if ($errors.Count) { throw ($errors -join '; ') }
+    return $findings.ToArray()
 }
 
 function Parse-YARAOutput {
@@ -681,7 +720,8 @@ function Export-ScanResults {
     param(
         [object[]]$AllFindings,
         [ValidateSet('Completed', 'Error')][string]$Status = 'Completed',
-        [string]$ScanError
+        [string[]]$ScanError,
+        [object[]]$Coverage = @()
     )
     
     if (-not $AllFindings) {
@@ -736,6 +776,7 @@ function Export-ScanResults {
             PowerShellVersion = $PSVersionTable.PSVersion.ToString()
             Scope = if ($QuickScan) { 'Quick' } else { 'Full' }
             Runtime = $runtime
+            Coverage = @($Coverage | Select-Object Root, Status, EnumeratedFiles, CompletedFiles, FileRuleAttempts, Errors)
         } | ConvertTo-Json -Depth 10
 
         # Specify UTF8 so non-ASCII characters in matched YARA strings are written
@@ -778,6 +819,7 @@ function Invoke-VolumeScans {
         'Write-Log'                 = ${function:Write-Log}.ToString()
         'Invoke-ProcessWithTimeout' = ${function:Invoke-ProcessWithTimeout}.ToString()
         'Invoke-YARAScan'           = ${function:Invoke-YARAScan}.ToString()
+        'Get-ScanInventory'         = ${function:Get-ScanInventory}.ToString()
         'Parse-YARAOutput'          = ${function:Parse-YARAOutput}.ToString()
         'Get-ScanTargets'           = ${function:Get-ScanTargets}.ToString()
         'Convert-ToWindowsPath'     = ${function:Convert-ToWindowsPath}.ToString()
@@ -795,19 +837,8 @@ function Invoke-VolumeScans {
         Write-Log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         Write-Log "Processing volume: $($volume.DriveLetter) (VM: $($volume.VMName))"
         $ErrorActionPreference = 'Stop'
-        $scanTargets = @(Get-ScanTargets -VolumeRoot $volume.DriveLetter)
-        Write-Log "Scan targets: $($scanTargets.Count) path(s)"
-        $findings = @(Invoke-YARAScan -ScanPaths $scanTargets `
-                        -VolumeRoot $volume.DriveLetter -VMName $volume.VMName `
-                        -YaraRuleFiles $YaraRuleFiles)
-        if ($findings) {
-            Write-Log "⚠️  Found $($findings.Count) matches in $($volume.DriveLetter)" -Level "WARNING"
-        } else {
-            Write-Log "✓ No threats detected in $($volume.DriveLetter)"
-        }
-        # Emit findings for the parent to collect (works for ThreadJob, Job, and
-        # direct invocation alike).
-        $findings
+        Invoke-YARAScan -ScanPaths @($volume.DriveLetter) -VolumeRoot $volume.DriveLetter -VMName $volume.VMName -YaraRuleFiles $YaraRuleFiles -Detailed
+
     }
 
     # Build the positional argument array for one volume. -ArgumentList unrolls
@@ -834,7 +865,10 @@ function Invoke-VolumeScans {
             if ($jobs.Count -ge $Throttle) {
                 $jobs | Wait-Job -ErrorAction Stop | Out-Null
                 foreach ($job in $jobs) {
-                    if ($job.State -ne 'Completed') { throw "Scan worker ended in state $($job.State): $($job.ChildJobs[0].JobStateInfo.Reason)" }
+                    if ($job.State -ne 'Completed') {
+                        $all += [pscustomobject]@{ Root = 'Worker'; Findings = @(); Errors = @("Scan worker ended in state $($job.State): $($job.ChildJobs[0].JobStateInfo.Reason)"); Status = 'Error'; EnumeratedFiles = 0; CompletedFiles = 0; FileRuleAttempts = 0 }
+                        continue
+                    }
                     $all += Receive-Job -Job $job -ErrorAction Stop
                 }
                 $jobs | Remove-Job -Force -ErrorAction Stop
@@ -844,7 +878,10 @@ function Invoke-VolumeScans {
         if ($jobs.Count -gt 0) {
             $jobs | Wait-Job -ErrorAction Stop | Out-Null
             foreach ($job in $jobs) {
-                if ($job.State -ne 'Completed') { throw "Scan worker ended in state $($job.State): $($job.ChildJobs[0].JobStateInfo.Reason)" }
+                if ($job.State -ne 'Completed') {
+                        $all += [pscustomobject]@{ Root = 'Worker'; Findings = @(); Errors = @("Scan worker ended in state $($job.State): $($job.ChildJobs[0].JobStateInfo.Reason)"); Status = 'Error'; EnumeratedFiles = 0; CompletedFiles = 0; FileRuleAttempts = 0 }
+                        continue
+                    }
                 $all += Receive-Job -Job $job -ErrorAction Stop
             }
         }
@@ -977,7 +1014,14 @@ try {
     $throttle = [Environment]::ProcessorCount
     Write-Log "Scanning $($volumes.Count) volume(s) (throttle: $throttle)"
 
-    $allFindings = @(Invoke-VolumeScans -Volumes $volumes -Throttle $throttle -YaraRuleFiles $yaraRules)
+    $scanResults = @(Invoke-VolumeScans -Volumes $volumes -Throttle $throttle -YaraRuleFiles $yaraRules)
+    $allFindings = @($scanResults | ForEach-Object { $_.Findings })
+    $scanErrors = @($scanResults | ForEach-Object { $_.Errors })
+    if ($scanErrors.Count) {
+        $null = Export-ScanResults -AllFindings $allFindings -Status Error -ScanError $scanErrors -Coverage $scanResults
+        Write-Log "Scan incomplete. Retained $($allFindings.Count) finding(s). $($scanErrors -join '; ')" -Level ERROR
+        exit 2
+    }
     
     # Display results
     Write-Log ""
@@ -997,7 +1041,7 @@ try {
         Send-SyslogAlert -Message $alertMsg -Severity 2   # Critical
         Send-VeeamOneAlarm -AlarmMessage $alertMsg -FindingsCount $allFindings.Count
 
-        $results = @(Export-ScanResults -AllFindings $allFindings)
+        $results = @(Export-ScanResults -AllFindings $allFindings -Coverage $scanResults)
         
         # Display detailed findings with onion links
         foreach ($result in $results) {
@@ -1027,7 +1071,7 @@ try {
         
     } else {
         Write-Log ""
-        $null = Export-ScanResults -AllFindings @()
+        $null = Export-ScanResults -AllFindings @() -Coverage $scanResults
         Write-Log "Scan completed. No selected YARA rules matched within the scanned scope."
         Write-Log ""
         Write-Log "Full report: $jsonReport"
@@ -1037,7 +1081,7 @@ try {
 } catch {
     Write-Log "FATAL ERROR: $_" -Level "ERROR"
     Write-Log $_.ScriptStackTrace -Level "ERROR"
-    try { $null = Export-ScanResults -AllFindings @() -Status Error -ScanError "$_" }
+    try { $null = Export-ScanResults -AllFindings @($allFindings) -Status Error -ScanError "$_" -Coverage @($scanResults) }
     catch { Write-Log "Could not persist the error report: $_" -Level ERROR }
     exit 2
 }

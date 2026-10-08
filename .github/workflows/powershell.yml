@@ -11,7 +11,6 @@ on:
       - '**.yara'
       - '.github/workflows/powershell.yml'
   pull_request:
-    branches: [main]
     paths:
       - '**.ps1'
       - '**.psm1'

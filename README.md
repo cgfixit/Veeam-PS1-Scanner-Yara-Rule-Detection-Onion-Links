@@ -37,7 +37,7 @@ The scanner accepts an explicit mounted directory through `-ScanPath`, resolves 
 
 ### Incomplete scans return an error
 
-A missing target or rule, failed discovery, inaccessible volume probe, YARA error, timeout, worker failure, or failed report write returns **exit 2**. An incomplete scan never returns a successful no-match result. Successful scans return 0 without matches or 1 with matches. These codes become restore decisions only through the caller's configured policy.
+A missing target or rule, failed discovery, inaccessible volume probe, YARA error, timeout, worker failure, or failed report write returns **exit 2**. Scanner-owned enumeration records inaccessible descendants and rejects descendant links/reparse points. These make the result incomplete even when YARA itself returns zero. Findings already collected are retained in error reports. Successful scans return 0 without matches or 1 with matches. These codes become restore decisions only through the caller's configured policy.
 
 The [test suite](tests/README.md) covers host selection, relaunch arguments, real YARA matching, process failures, and simulated mounted directories. Its runner reports the current test count and writes NUnit results.
 
@@ -173,7 +173,7 @@ Use Standalone mode when the scanner runs on a Windows mount server that does no
 	-LogPath 'D:\ScanReports' -ExecutionMode Sequential
 ```
 
-Use `-ScanPath` for the exact mounted directory supplied by your workflow. Without it, the scanner discovers non-system NTFS/ReFS drive-letter volumes with Windows or Users directories. That heuristic does not prove a volume belongs to a particular Veeam session and cannot discover every mount layout.
+Use `-ScanPath` for the exact mounted directory supplied by your workflow. Without it, the scanner discovers non-system NTFS/ReFS drive-letter volumes with Windows or Users directories. That heuristic does not prove a volume belongs to a particular Veeam session and cannot discover every mount layout. Supply each approved mounted disk root explicitly when a parent directory contains junctions: descendant links are rejected, while the starting root is explicitly authorized by the caller. Use stable, read-only restore mounts; this path-based scanner does not provide handle-level protection against concurrent privileged replacement of mount paths. QuickScan filters files beneath each supplied disk root and reports an error when no files match its selected subdirectories.
 
 ### Secure Restore antivirus configuration
 
