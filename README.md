@@ -775,3 +775,9 @@ Contributions welcome! Please submit:
 - [Veeam Secure Restore Guide](https://helpcenter.veeam.com/docs/vbr/userguide/malware_detection_scan_backup_yara.html)
 - [GitHub Repository](https://github.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links)
 - [Report Issues](https://github.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links/issues)
+
+### Structured evidence and notification status
+
+Schema version 2 preserves the legacy grouped fields and adds per-rule `RuleEvidence` (metadata, string identifier, byte offset, and the original CLI-escaped value) plus canonical `Indicators` for syntactically valid 16/56-character onion hosts. Canonical hosts are lowercase and deduplicated; raw evidence is retained. Neither a rule's severity nor an indicator proves infection or network activity. Rule metadata is declarative, not a confidence score.
+
+Reports are written through a same-directory temporary file before optional notifications. Syslog has bounded DNS/send waits and reports `Submitted` (UDP delivery is unconfirmed) or `Failed`. The former Veeam ONE POST example was not a supported alarm-creation API: `-EnableVeeamOne` now records `Unsupported` without making that request. Notification results are separate from scan completeness and do not turn a detection into a clean result. The report retains exit 1 for completed scans with matches and exit 2 for incomplete scans.

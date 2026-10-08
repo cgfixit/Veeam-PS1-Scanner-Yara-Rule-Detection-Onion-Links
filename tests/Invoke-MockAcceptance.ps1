@@ -25,6 +25,11 @@ function Invoke-ScannerFixture {
     }
     $expected = 0
     switch ($Scenario) {
+        'NotificationUnsupported' {
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/malicious/ransom_note_onion.txt') -Destination $target
+            $parameters.EnableVeeamOne = $true
+            $expected = 1
+        }
         'Detected' {
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/malicious/ransom_note_onion.txt') -Destination $target
             $expected = 1
