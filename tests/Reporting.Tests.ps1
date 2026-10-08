@@ -14,6 +14,10 @@ Describe 'Structured evidence contract' {
         $f[0].Evidence[0].RawValue | Should -Be $wide
         $f[0].Indicators | Should -Contain 'abcdefghijklmnop.onion'
     }
+    It 'retains significant leading and trailing spaces in match evidence' {
+        $f = @(Parse-YARAOutput -Output @('sample E:\note.txt', '0x0:$host:  abcdefghijklmnop.onion ') -VolumeRoot 'E:\' -VMName 'fixture')
+        $f[0].Evidence[0].RawValue | Should -Be ' abcdefghijklmnop.onion '
+    }
     It 'does not normalize an invalid hostname into a valid IOC' {
         $f = @(Parse-YARAOutput -Output @('sample E:\note.txt', '0x0:$host: aabcdefghijklmnop.onion') -VolumeRoot 'E:\' -VMName 'fixture')
         $f[0].Indicators | Should -HaveCount 0

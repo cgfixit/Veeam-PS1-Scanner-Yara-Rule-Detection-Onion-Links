@@ -631,7 +631,7 @@ function Parse-YARAOutput {
         # Guard against null entries in the output array (a null .ToString()
         # would throw and abort parsing of every remaining finding).
         if ($null -eq $line) { continue }
-        $lineStr = $line.ToString().Trim()
+        $lineStr = $line.ToString().TrimEnd("`r", "`n")
 
         # Skip empty lines and errors
         if ([string]::IsNullOrWhiteSpace($lineStr)) { continue }
@@ -687,7 +687,7 @@ function Parse-YARAOutput {
         }
         # Match pattern: 0x<offset>:$<identifier>: <matched_string>
         # This captures the actual .onion URLs and other matched strings
-        elseif ($lineStr -match '^0x([0-9a-f]+):(\$[^:]+):\s*(.*)$') {
+        elseif ($lineStr -match '^0x([0-9a-f]+):(\$[^:]+): ?(.*)$') {
             $offsetValue = [Convert]::ToInt64($Matches[1], 16)
             $identifier = $Matches[2]
             $matchedString = $Matches[3]
