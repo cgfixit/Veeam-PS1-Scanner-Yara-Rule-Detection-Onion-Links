@@ -33,7 +33,7 @@ A comprehensive malware detection system combining YARA rules with PowerShell au
 
 `Veeam-YARA-SecureRestore.ps1` now selects the PowerShell host before scanning. Default `-RuntimeMode Auto` reads the installed local VBR server version and keeps or relaunches the process into the required x64 runtime. A VBR 12.3.2 server uses Windows PowerShell 5.1 even if PowerShell 7 launched the script. Supported Windows VBR 13 builds use PowerShell 7. See the exact [runtime policy](#compatibility).
 
-The scanner accepts an explicit mounted directory through `-ScanPath`, resolves quick-scan wildcards, extracts onion links, and writes JSON reports. Paths in reports identify files on the scanning host. The scanner does not reconstruct original guest drive letters.
+The scanner accepts an explicit mounted directory through `-ScanPath`, selects quick-scan files relative to each mounted disk root, extracts onion links, and writes JSON reports. Paths in reports identify files on the scanning host. The scanner does not reconstruct original guest drive letters.
 
 ### Incomplete scans return an error
 
@@ -185,7 +185,7 @@ The following is an illustrative entry for a **separate Windows mount server wit
 <AntivirusInfo Type="Windows" Name="YARA mounted-file scanner"
 	IsPortableSoftware="true"
 	ExecutableFilePath="C:\Program Files\PowerShell\7\pwsh.exe"
-	CommandLineParameters="-NoLogo -NoProfile -NonInteractive -File &quot;C:\Scripts\Veeam-YARA-SecureRestore.ps1&quot; -RuntimeMode Standalone -ScanPath &quot;%Path%&quot;"
+	CommandLineParameters="-NoLogo -NoProfile -NonInteractive -File &quot;C:\Scripts\Veeam-YARA-SecureRestore.ps1&quot; -RuntimeMode Standalone -RequireExplicitScanPath -ScanPath &quot;%Path%&quot;"
 	RegPath="" ServiceName="" ThreatExistsRegEx=""
 	IsParallelScanAvailable="false" OutputSupported="true">
 	<ExitCodes>
@@ -206,6 +206,7 @@ SureBackup orchestration must likewise provide a directory that is actually moun
 |--------|----------|
 | `-RuntimeMode Auto` | Default. Enforces the local Windows VBR policy before scanning. |
 | `-RuntimeMode Standalone` | Keeps the current PowerShell host without VBR detection. |
+| `-RequireExplicitScanPath` | Rejects heuristic volume discovery; recommended for unattended deployments. |
 | `-PreflightOnly` | Reports runtime selection as JSON without scanning or creating scan logs. |
 | `-ScanPath` | One or more existing filesystem directories. A missing directory is an error. |
 | `-QuickScan` | Expands selected high-risk subdirectories beneath each scan root. It deliberately reduces coverage. |
@@ -781,3 +782,9 @@ Contributions welcome! Please submit:
 Schema version 2 preserves the legacy grouped fields and adds per-rule `RuleEvidence` (metadata, string identifier, byte offset, and the original CLI-escaped value) plus canonical `Indicators` for syntactically valid 16/56-character onion hosts. Canonical hosts are lowercase and deduplicated; raw evidence is retained. Neither a rule's severity nor an indicator proves infection or network activity. Rule metadata is declarative, not a confidence score.
 
 Reports are written through a same-directory temporary file before optional notifications. Syslog has bounded DNS/send waits and reports `Submitted` (UDP delivery is unconfirmed) or `Failed`. The former Veeam ONE POST example was not a supported alarm-creation API: `-EnableVeeamOne` now records `Unsupported` without making that request. Notification results are separate from scan completeness and do not turn a detection into a clean result. The report retains exit 1 for completed scans with matches and exit 2 for incomplete scans.
+
+### Deployment acceptance
+
+Use the [deployment acceptance procedure](docs/DEPLOYMENT-ACCEPTANCE.md) before enabling a restore policy. `-RequireExplicitScanPath` rejects missing targets; place reports outside every scan target. Log and report directory aliases must also resolve outside the restore mounts. Keep mount contents stable and read-only while scanning.
+
+A completed zero-match result means only that the selected rules did not match the recorded scope. A QuickScan or a file-size-limited rule pack is not a full-content assurance. Parent mount paths containing disk junctions need explicitly selected disk roots; the scanner rejects descendant reparse points. Runtime preflight, emulated mounts, hosted Windows checks, and live VBR restore acceptance are distinct evidence.

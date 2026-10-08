@@ -42,6 +42,8 @@ param(
 
     [string[]]$ScanPath,
 
+    [switch]$RequireExplicitScanPath,
+
     [ValidateSet('Auto', 'Sequential', 'Job', 'ThreadJob')]
     [string]$ExecutionMode = 'Auto',
 
@@ -1036,6 +1038,7 @@ try {
     Write-Log "Found $ruleCount YARA rule file(s)"
     
     # Discover mounted volumes
+    if ($RequireExplicitScanPath -and -not $ScanPath) { throw 'Explicit -ScanPath is required for this deployment.' }
     if ($ScanPath) {
         $volumes = @(foreach ($target in $ScanPath) {
             $resolved = Get-Item -LiteralPath $target -ErrorAction Stop
@@ -1048,6 +1051,16 @@ try {
         $volumes = @(Get-MountedVMVolumes)
     }
     if ($volumes.Count -eq 0) { throw 'No volumes to scan. Supply -ScanPath with the mounted restore directory.' }
+    # Reports/logs must not become inputs to this scan. Compare path components,
+    # including separators, so sibling names are not mistaken for descendants.
+    $comparison = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $reportDirectory = [IO.Path]::GetFullPath((Split-Path $jsonReport -Parent)).TrimEnd('\','/')
+    foreach ($volume in $volumes) {
+        $rootPath = [IO.Path]::GetFullPath($volume.DriveLetter).TrimEnd('\','/')
+        if ($reportDirectory.Equals($rootPath, $comparison) -or $reportDirectory.StartsWith($rootPath + [IO.Path]::DirectorySeparatorChar, $comparison)) {
+            throw 'Report directory must be outside every scan target. Choose a separate -LogPath.'
+        }
+    }
     
 
     $throttle = [Environment]::ProcessorCount

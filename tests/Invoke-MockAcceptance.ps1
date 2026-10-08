@@ -56,6 +56,8 @@ function Invoke-ScannerFixture {
             $parameters.ScanPath = @($target, $missing)
             $expected = 2
         }
+        'ExplicitTargetRequired' { $parameters.Remove('ScanPath'); $parameters.RequireExplicitScanPath = $true; $expected = 2 }
+        'ReportInsideTarget' { $parameters.LogPath = Join-Path $target 'logs'; $logs = $parameters.LogPath; $expected = 2 }
         'Clean' {}
         default { throw "Unknown fixture scenario '$Scenario'." }
     }
