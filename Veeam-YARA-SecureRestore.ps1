@@ -593,7 +593,12 @@ function Invoke-YARAScan {
                 $batch = @($scanFiles[$offset..([Math]::Min($offset + 127, $scanFiles.Count - 1))])
                 $list = [IO.Path]::GetTempFileName()
                 try {
-                    [IO.File]::WriteAllLines($list, [string[]]$batch, [Text.UTF8Encoding]::new($false))
+                    # YARA's Windows scan-list reader treats raw bytes as wchar_t;
+                    # Unix uses getline. Neither reader strips a BOM.
+                    $listEncoding = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+                        [Text.UnicodeEncoding]::new($false, $false)
+                    } else { [Text.UTF8Encoding]::new($false) }
+                    [IO.File]::WriteAllLines($list, [string[]]$batch, $listEncoding)
                     $batchComplete = $true
                     foreach ($ruleFile in $yaraRules) {
                         if (-not $empty) { $attempted += $batch.Count }
