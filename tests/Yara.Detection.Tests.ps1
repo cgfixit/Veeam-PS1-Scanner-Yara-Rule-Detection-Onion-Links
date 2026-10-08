@@ -124,12 +124,9 @@ Describe 'True negatives (benign fixtures exercise FP exclusions)' -Skip:(-not $
         $hits | Should -BeNullOrEmpty -Because "$File is benign and must not match"
     }
 
-    It 'a ransom note that name-drops "Tor Browser" is still excluded from onion_links_simple' {
-        # ransom_note_onion.txt mentions "Tor Browser", which is an FP-exclusion
-        # string for onion_links_simple — so the broad rule must NOT fire even
-        # though the context rule (comprehensive) does.
+    It 'does not let Tor Browser wording suppress ransomware context' {
         $hits = Get-YaraRuleHits -RuleFile $script:RuleFile -Target (Join-Path $script:MalDir 'ransom_note_onion.txt')
-        $hits | Should -Not -Contain 'onion_links_simple'
+        $hits | Should -Contain 'onion_links_simple'
         $hits | Should -Contain 'comprehensive_onion_detection'
     }
 }
