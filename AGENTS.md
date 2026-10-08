@@ -19,8 +19,8 @@ Validation commands:
 
 Repo facts:
 
-- Primary compatibility target is Windows PowerShell 5.1 on Veeam v12.x hosts.
-- PowerShell 7 is an acceleration path, not the baseline behavior contract.
+- Auto mode uses Windows PowerShell 5.1 for VBR 12.3.2 and supported PowerShell 7 floors for the documented Windows VBR 13 families; see README compatibility.
+- Runtime selection is a compatibility contract, not an acceleration choice. Keep host-selection and scanner behavior distinct.
 - `Veeam-YARA-SecureRestore.ps1` must remain safe to dot-source with `VEEAM_YARA_NOEXEC=1` for tests.
 - YARA rules live in `yara-malware-detection.yara`; scanner logic lives in `Veeam-YARA-SecureRestore.ps1`.
 - The test suite uses Pester plus real/synthetic YARA fixture coverage in `tests/`.
@@ -28,7 +28,7 @@ Repo facts:
 Change rules:
 
 - Preserve PowerShell 5.1 parsing compatibility unless the maintainer explicitly drops it.
-- Do not weaken timeout handling, logging fallbacks, HTTPS-only Veeam ONE alarms, or test dot-sourcing guards.
+- Do not weaken timeout handling, logging fallbacks, bounded optional notifications (Veeam ONE alarm creation is unsupported), or test dot-sourcing guards.
 - Prefer native PowerShell and current repo helpers over adding wrappers or helper scripts.
 - Keep scanner and rule changes reviewable. Avoid mixing README/marketing edits with behavioral changes unless the docs would otherwise lie.
 
