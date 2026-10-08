@@ -54,6 +54,12 @@ The [test suite](tests/README.md) covers host selection, relaunch arguments, rea
 
 ---
 
+### Rule matching boundaries
+
+Text indicators support ASCII and UTF-16LE, including uppercase host text. Tor patterns accept bounded 16- or 56-character base32 host labels; length matching does not validate a v3 checksum or prove maliciousness. A generic JSON endpoint is insufficient for the C2 rule. Documentation exclusions use word boundaries, and strong paired ransomware context overrides those exclusions. Rule size caps still limit coverage and are not a malware-free guarantee.
+
+---
+
 ## PowerShell Integration
 
 ### Execution flow
@@ -775,7 +781,3 @@ Contributions welcome! Please submit:
 - [Veeam Secure Restore Guide](https://helpcenter.veeam.com/docs/vbr/userguide/malware_detection_scan_backup_yara.html)
 - [GitHub Repository](https://github.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links)
 - [Report Issues](https://github.com/cgfixit/veeam-ps1-scanner-yara-rule-detection-onion-links/issues)
-
-### Rule matching boundaries
-
-Text indicators support ASCII and UTF-16LE, including uppercase host text. Tor patterns accept bounded 16- or 56-character base32 host labels; length matching does not validate a v3 checksum or prove maliciousness. A generic JSON endpoint is insufficient for the C2 rule. Documentation exclusions use word boundaries, and strong paired ransomware context overrides those exclusions. Rule size caps still limit coverage and are not a malware-free guarantee.
