@@ -31,13 +31,13 @@ A comprehensive malware detection system combining YARA rules with PowerShell au
 
 ### One script for supported Windows VBR hosts
 
-`Veeam-YARA-SecureRestore.ps1` now selects the PowerShell host before scanning. Default `-RuntimeMode Auto` reads the installed local VBR server version and keeps or relaunches the process into the required x64 runtime. A VBR 12.3.2 server uses Windows PowerShell 5.1 even if PowerShell 7 launched the script. Supported Windows VBR 13 builds use PowerShell 7. See the exact [runtime policy](#compatibility).
+`Veeam-YARA-SecureRestore.ps1` now selects the PowerShell host before scanning. Default `-RuntimeMode Auto` reads the installed local VBR server version and keeps or relaunches the process into the required x64 runtime. A VBR 12.x server (12.0 through 12.3.2) uses Windows PowerShell 5.1 even if PowerShell 7 launched the script. Supported Windows VBR 13 builds use PowerShell 7. See the exact [runtime policy](#compatibility).
 
 The scanner accepts an explicit mounted directory through `-ScanPath`, selects quick-scan files relative to each mounted disk root, extracts onion links, and writes JSON reports. Paths in reports identify files on the scanning host. The scanner does not reconstruct original guest drive letters.
 
 ### Incomplete scans return an error
 
-A missing target or rule, failed discovery, inaccessible volume probe, YARA error, timeout, worker failure, or failed report write returns **exit 2**. Scanner-owned enumeration records inaccessible descendants and rejects descendant links/reparse points. These make the result incomplete even when YARA itself returns zero. Findings already collected are retained in error reports. Successful scans return 0 without matches or 1 with matches. These codes become restore decisions only through the caller's configured policy.
+A missing target or rule, failed discovery, inaccessible volume probe, YARA error, timeout, worker failure, or failed report write returns **exit 2**. Scanner-owned enumeration records inaccessible descendants as errors, which make the result incomplete even when YARA itself returns zero. Descendant links (junctions such as `Documents and Settings`, symlinks, app execution aliases) and cloud/offline placeholders are never followed: they are skipped and listed under each report `Coverage` entry (`SkippedCount`, `Skipped`). Directly beneath a non-volume root such as `C:\VeeamFLR\<machine>`, only volume mount points (`Volume{GUID}` targets) are traversed; any other link there returns exit 2. Findings already collected are retained in error reports. Successful scans return 0 without matches or 1 with matches. These codes become restore decisions only through the caller's configured policy.
 
 The [test suite](tests/README.md) covers host selection, relaunch arguments, real YARA matching, process failures, and simulated mounted directories. Its runner reports the current test count and writes NUnit results.
 
@@ -146,7 +146,7 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/cgfixit/veeam-ps1-scan
 
 ### Manual or scheduled execution on the local VBR server
 
-Launch the same scanner file from an installed PowerShell host. Auto mode checks the actual process edition, version, architecture, and release status before scanning. A VBR 12.3.2 host with both shells selects x64 Windows PowerShell 5.1. A supported VBR 13 host with only PowerShell 7 can start directly in `pwsh.exe`.
+Launch the same scanner file from an installed PowerShell host. Auto mode checks the actual process edition, version, architecture, and release status before scanning. A VBR 12.x host with both shells selects x64 Windows PowerShell 5.1. A supported VBR 13 host with only PowerShell 7 can start directly in `pwsh.exe`.
 
 ```powershell
 # Check the local VBR policy and selected runtime without scanning.
@@ -179,7 +179,7 @@ Use Standalone mode when the scanner runs on a Windows mount server that does no
 	-LogPath 'D:\ScanReports' -ExecutionMode Sequential
 ```
 
-Use `-ScanPath` for the exact mounted directory supplied by your workflow. Without it, the scanner discovers non-system NTFS/ReFS drive-letter volumes with Windows or Users directories. That heuristic does not prove a volume belongs to a particular Veeam session and cannot discover every mount layout. Supply each approved mounted disk root explicitly when a parent directory contains junctions: descendant links are rejected, while the starting root is explicitly authorized by the caller. Use stable, read-only restore mounts; this path-based scanner does not provide handle-level protection against concurrent privileged replacement of mount paths. QuickScan filters files beneath each supplied disk root and reports an error when no files match its selected subdirectories.
+Use `-ScanPath` for the exact mounted directory supplied by your workflow. Without it, the scanner discovers non-system NTFS/ReFS drive-letter volumes with Windows or Users directories. That heuristic does not prove a volume belongs to a particular Veeam session and cannot discover every mount layout. A Veeam mount parent such as `C:\VeeamFLR\<machine>` is accepted when its children are volume mount points; descendant links are skipped and reported, never followed, while the starting root is explicitly authorized by the caller. If an unrecognized link sits directly under the parent, supply each mounted disk root explicitly. Use stable, read-only restore mounts; this path-based scanner does not provide handle-level protection against concurrent privileged replacement of mount paths. QuickScan filters files beneath each supplied disk root and reports an error when no files match its selected subdirectories.
 
 ### Secure Restore antivirus configuration
 
@@ -471,7 +471,7 @@ Auto mode supports the following **Windows VBR runtime policy**. Every selected 
 
 | Local Windows VBR version | Required PowerShell process | Source for the policy |
 |---------------------------|-----------------------------|-----------------------|
-| `12.3.2.x` | Windows PowerShell 5.1, Desktop edition | [V12 reference, current archived build 12.3.2.4854](https://helpcenter.veeam.com/archive/backup/120/powershell/getting_started.html) |
+| `12.0.x` through `12.3.x` | Windows PowerShell 5.1, Desktop edition | [V12 reference, current archived build 12.3.2.4854](https://helpcenter.veeam.com/archive/backup/120/powershell/getting_started.html) |
 | `13.0.x` from `13.0.1.180` | PowerShell 7, Core edition, version `7.4.13` or later | [Windows V13.0.1 release notes](https://helpcenter.veeam.com/rn/veeam_backup_13_0_1_release_notes.html) |
 | `13.1.x` | PowerShell 7, Core edition, version `7.6.3` or later | [Current V13.1 PowerShell requirements](https://helpcenter.veeam.com/docs/vbr/powershell/running_ps_sessions_windows.html) |
 
@@ -793,4 +793,4 @@ Reports are written through a same-directory temporary file before optional noti
 
 Use the [deployment acceptance procedure](docs/DEPLOYMENT-ACCEPTANCE.md) before enabling a restore policy. `-RequireExplicitScanPath` rejects missing targets; place reports outside every scan target. Log and report directory aliases must also resolve outside the restore mounts. Keep mount contents stable and read-only while scanning.
 
-A completed zero-match result means only that the selected rules did not match the recorded scope. A QuickScan or a file-size-limited rule pack is not a full-content assurance. Parent mount paths containing disk junctions need explicitly selected disk roots; the scanner rejects descendant reparse points. Runtime preflight, emulated mounts, hosted Windows checks, and live VBR restore acceptance are distinct evidence.
+A completed zero-match result means only that the selected rules did not match the recorded scope. A QuickScan or a file-size-limited rule pack is not a full-content assurance. Skipped links and non-local placeholders are listed in the report and are not scanned through the link; their targets are covered only where they are themselves inside a scan root. Runtime preflight, emulated mounts, hosted Windows checks, and live VBR restore acceptance are distinct evidence.
