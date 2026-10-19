@@ -73,7 +73,9 @@ $script:DotSourced = ($MyInvocation.InvocationName -eq '.') -or [bool]$env:VEEAM
 function Get-VbrRuntimeRequirement {
     param([Parameter(Mandatory)][version]$VbrVersion)
 
-    if ($VbrVersion.Major -eq 12 -and $VbrVersion.Minor -eq 3 -and $VbrVersion.Build -eq 2) {
+    # Every V12 release (12.0 through 12.3.2) ships a .NET Framework module that
+    # only Windows PowerShell 5.1 loads; V13 moved to .NET and PowerShell 7.
+    if ($VbrVersion.Major -eq 12 -and $VbrVersion.Minor -le 3) {
         return [pscustomobject]@{ VbrVersion = $VbrVersion; PSEdition = 'Desktop'; PSMajor = 5; MinimumVersion = [version]'5.1' }
     }
     if ($VbrVersion.Major -eq 13 -and $VbrVersion.Minor -eq 0 -and $VbrVersion -ge [version]'13.0.1.180') {
@@ -82,7 +84,7 @@ function Get-VbrRuntimeRequirement {
     if ($VbrVersion.Major -eq 13 -and $VbrVersion.Minor -eq 1) {
         return [pscustomobject]@{ VbrVersion = $VbrVersion; PSEdition = 'Core'; PSMajor = 7; MinimumVersion = [version]'7.6.3' }
     }
-    throw "Unsupported Windows VBR build '$VbrVersion'. Supported families are 12.3.2, Windows 13.0.1.180 or later 13.0, and 13.1. Review vendor requirements before adding another family."
+    throw "Unsupported Windows VBR build '$VbrVersion'. Supported families are 12.0 through 12.3, Windows 13.0.1.180 or later 13.0, and 13.1. Review vendor requirements before adding another family."
 }
 
 function Get-InstalledVbrVersion {
@@ -505,19 +507,51 @@ function Get-ScanInventory {
     param([string]$Root)
     $files = [Collections.Generic.List[string]]::new()
     $errors = [Collections.Generic.List[string]]::new()
+    $skipped = [Collections.Generic.List[string]]::new()
+    $topLevel = [Collections.Generic.HashSet[string]]::new()
     $pending = [Collections.Generic.Stack[string]]::new()
-    $pending.Push($Root)
+    # A drive root or an explicitly supplied mount point is a volume, so links
+    # inside it are guest junctions/symlinks. Any other root may be a mount
+    # parent such as C:\VeeamFLR\<machine>, whose children are the volumes.
+    $rootIsVolume = $false
+    try {
+        $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+        $rootIsVolume = ($rootItem.FullName.TrimEnd('\','/') -eq ([IO.Path]::GetPathRoot($rootItem.FullName)).TrimEnd('\','/')) -or
+            [bool]($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        $pending.Push($Root)
+    } catch { $errors.Add("Cannot inventory '$Root': $_") }
     while ($pending.Count) {
         $path = $pending.Pop()
         try {
             $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
             # The caller explicitly authorizes the starting root. Descendant links
-            # are never followed, including Windows junctions and reparse points.
+            # are never followed: every Windows volume carries junctions such as
+            # "Documents and Settings", so they are skipped and reported rather
+            # than failing the scan. Their targets are scanned where they live.
             if ($path -ne $Root -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-                throw "Descendant link/reparse point is outside the traversal policy: $path"
+                if ($item.PSIsContainer -and $topLevel.Contains($path) -and -not $rootIsVolume) {
+                    # Under a mount parent only volume mount points are traversed;
+                    # anything else could hide a whole volume, so fail closed.
+                    if ((@($item.Target) -join '') -notmatch 'Volume\{[0-9A-Fa-f-]+\}') {
+                        throw "Descendant link/reparse point directly under a non-volume scan root is not a recognized volume mount point: $path"
+                    }
+                } elseif ($item.PSIsContainer -or $item.LinkType -in @('SymbolicLink', 'Junction') -or $item.Length -eq 0) {
+                    # Directory links, file symlinks and data-less reparse files
+                    # (app execution aliases). WOF/dedup files keep their data,
+                    # including hard-linked ones (LinkType 'HardLink' on 5.1).
+                    $skipped.Add("link: $path")
+                    continue
+                }
+            }
+            # Offline | RecallOnOpen | RecallOnDataAccess: cloud placeholders and
+            # HSM stubs whose data is not on the mounted volume.
+            if (-not $item.PSIsContainer -and ([int64]$item.Attributes -band 0x441000)) {
+                $skipped.Add("not local: $path")
+                continue
             }
             if ($item.PSIsContainer) {
                 foreach ($child in @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)) {
+                    if ($path -eq $Root) { $null = $topLevel.Add($child.FullName) }
                     $pending.Push($child.FullName)
                 }
             } else {
@@ -526,7 +560,7 @@ function Get-ScanInventory {
             }
         } catch { $errors.Add("Cannot inventory '$path': $_") }
     }
-    [pscustomobject]@{ Files = $files.ToArray(); Errors = $errors.ToArray() }
+    [pscustomobject]@{ Files = $files.ToArray(); Errors = $errors.ToArray(); Skipped = $skipped.ToArray() }
 }
 
 function Invoke-YARAScan {
@@ -540,6 +574,7 @@ function Invoke-YARAScan {
     $findings = [Collections.Generic.List[object]]::new()
     $errors = [Collections.Generic.List[string]]::new()
     $files = [Collections.Generic.List[string]]::new()
+    $skipped = [Collections.Generic.List[string]]::new()
     $comparer = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }
     $seen = [Collections.Generic.HashSet[string]]::new($comparer)
     $completed = 0
@@ -552,6 +587,7 @@ function Invoke-YARAScan {
         foreach ($scanPath in $ScanPaths) {
             $inventory = Get-ScanInventory -Root $scanPath
             foreach ($failure in $inventory.Errors) { $errors.Add($failure) }
+            foreach ($entry in $inventory.Skipped) { $skipped.Add($entry) }
             foreach ($file in $inventory.Files) {
                 if ($QuickScan) {
                     $relative = $file.Substring($VolumeRoot.TrimEnd('\','/').Length).TrimStart('\','/').Replace('\','/')
@@ -608,6 +644,7 @@ function Invoke-YARAScan {
     $result = [pscustomobject]@{
         Root = $VolumeRoot; Findings = $findings.ToArray(); Errors = $errors.ToArray()
         EnumeratedFiles = $files.Count; CompletedFiles = $completed; FileRuleAttempts = $attempted
+        SkippedCount = $skipped.Count; Skipped = @($skipped | Select-Object -First 100)
         Status = if ($errors.Count) { 'Error' } else { 'Completed' }
     }
     if ($Detailed) { return $result }
@@ -806,7 +843,7 @@ function Export-ScanResults {
             PowerShellVersion = $PSVersionTable.PSVersion.ToString()
             Scope = if ($QuickScan) { 'Quick' } else { 'Full' }
             Runtime = $runtime
-            Coverage = @($Coverage | Select-Object Root, Status, EnumeratedFiles, CompletedFiles, FileRuleAttempts, Errors)
+            Coverage = @($Coverage | Select-Object Root, Status, EnumeratedFiles, CompletedFiles, FileRuleAttempts, SkippedCount, Skipped, Errors)
         } | ConvertTo-Json -Depth 10
 
         # Specify UTF8 so non-ASCII characters in matched YARA strings are written
@@ -1069,6 +1106,9 @@ try {
     $scanResults = @(Invoke-VolumeScans -Volumes $volumes -Throttle $throttle -YaraRuleFiles $yaraRules)
     $allFindings = @($scanResults | ForEach-Object { $_.Findings })
     $scanErrors = @($scanResults | ForEach-Object { $_.Errors })
+    $skippedCount = 0
+    foreach ($scanResult in $scanResults) { $skippedCount += [int]$scanResult.SkippedCount }
+    if ($skippedCount) { Write-Log "Skipped $skippedCount link(s) or non-local file(s) without following them; see report Coverage." -Level WARNING }
     if ($scanErrors.Count) {
         $null = Export-ScanResults -AllFindings $allFindings -Status Error -ScanError $scanErrors -Coverage $scanResults
         Write-Log "Scan incomplete. Retained $($allFindings.Count) finding(s). $($scanErrors -join '; ')" -Level ERROR

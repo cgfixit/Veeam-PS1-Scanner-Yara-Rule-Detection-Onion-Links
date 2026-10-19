@@ -9,6 +9,9 @@ BeforeAll {
 
 Describe 'Installed VBR runtime policy' {
     It 'selects <Edition> PowerShell <Minimum> for <Build>' -ForEach @(
+        @{ Build = '12.0.0.1420'; Edition = 'Desktop'; Minimum = '5.1'; Major = 5 }
+        @{ Build = '12.1.2.172'; Edition = 'Desktop'; Minimum = '5.1'; Major = 5 }
+        @{ Build = '12.3.1.1139'; Edition = 'Desktop'; Minimum = '5.1'; Major = 5 }
         @{ Build = '12.3.2.4165'; Edition = 'Desktop'; Minimum = '5.1'; Major = 5 }
         @{ Build = '12.3.2.4854'; Edition = 'Desktop'; Minimum = '5.1'; Major = 5 }
         @{ Build = '13.0.1.180'; Edition = 'Core'; Minimum = '7.4.13'; Major = 7 }
@@ -26,7 +29,7 @@ Describe 'Installed VBR runtime policy' {
 
     It 'rejects unsupported or non-Windows VBR build <Build>' -ForEach @(
         @{ Build = '11.0.0.0' }
-        @{ Build = '12.3.1.1139' }
+        @{ Build = '11.0.1.1261' }
         @{ Build = '12.4.0.0' }
         @{ Build = '13.0.0.4967' }
         @{ Build = '13.0.1.179' }
